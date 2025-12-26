@@ -193,6 +193,16 @@ def test_storage_access_cold(
     prefix_cost = (
         gas_costs.G_VERY_LOW  # Target slots push
     )
+    if not absent_slots:
+        # Additional cost for init check prefix in execution phase
+        # CALLDATASIZE + ISZERO + PUSH2 + JUMPI + JUMPDEST
+        prefix_cost += (
+            gas_costs.G_BASE  # CALLDATASIZE
+            + gas_costs.G_VERY_LOW  # ISZERO
+            + gas_costs.G_VERY_LOW  # PUSH2
+            + gas_costs.G_HIGH  # JUMPI
+            + gas_costs.G_JUMPDEST  # outer JUMPDEST
+        )
 
     suffix_cost = 0
     if tx_result == TransactionResult.REVERT:
@@ -423,12 +433,12 @@ def test_storage_access_cold(
 
     benchmark_test(
         blocks=blocks,
-        skip_gas_used_validation=True,
-        # expected_benchmark_gas_used=(
-        #     total_gas_used
-        #     if tx_result != TransactionResult.OUT_OF_GAS
-        #     else gas_benchmark_value
-        # ),
+        # skip_gas_used_validation=True,
+        expected_benchmark_gas_used=(
+            total_gas_used
+            if tx_result != TransactionResult.OUT_OF_GAS
+            else gas_benchmark_value
+        ),
         post=post,
     )
 
