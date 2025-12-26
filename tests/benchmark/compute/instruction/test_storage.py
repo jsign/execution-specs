@@ -374,9 +374,6 @@ def test_storage_access_cold(
         ) // slot_init_loop_cost
         num_init_txs = math.ceil(num_target_slots / max_slots_per_tx)
 
-        print("Num init txs:", num_init_txs)
-        print("Max slots per tx:", max_slots_per_tx)
-
         for i in range(num_init_txs):
             # Slots 1 to num_target_slots (matching execution loop which decrements from n to 1)
             start_slot = 1 + i * max_slots_per_tx
