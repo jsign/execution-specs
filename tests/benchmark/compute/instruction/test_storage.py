@@ -91,8 +91,8 @@ def test_tstore(
 
 
 # Calldata sizes for mode dispatch:
-# - Exec mode:  64 bytes (start_slot + count) - no padding for efficiency
-# - Init mode:  65 bytes (start_slot + count + 1 padding byte) - padding ok, not benchmarked
+# - Exec mode: 64 bytes (start_slot + count) - no padding for efficiency
+# - Init mode: 65 bytes (start_slot + count + padding) - not benchmarked
 INIT_CALLDATA_SIZE = 65
 EXEC_CALLDATA_SIZE = 64
 
@@ -108,8 +108,8 @@ def _build_cold_storage_contract(
     - CALLDATASIZE == 65: Init mode - SSTORE(slot, slot) for each slot
     - CALLDATASIZE == 64: Exec mode - run execution_code_body for each slot
 
-    Exec mode uses 64 bytes (no padding) for efficiency since it's the benchmarked path.
-    Init mode uses 65 bytes (with padding) since setup efficiency doesn't matter.
+    Exec mode uses 64 bytes (no padding) for efficiency since it's benchmarked.
+    Init mode uses 65 bytes (with padding) since setup speed is irrelevant.
 
     Both modes read (start_slot, count) from calldata and loop count times,
     incrementing the slot number each iteration.
@@ -233,7 +233,9 @@ def _deploy_cold_storage_contract(
             remaining = init_slot_count - i * max_slots_per_tx
             count = min(max_slots_per_tx, remaining)
             # Padding byte triggers init mode (65 bytes)
-            calldata = start.to_bytes(32, "big") + count.to_bytes(32, "big") + b"\x00"
+            calldata = (
+                start.to_bytes(32, "big") + count.to_bytes(32, "big") + b"\x00"
+            )
 
             setup_txs.append(
                 Transaction(
@@ -245,6 +247,7 @@ def _deploy_cold_storage_contract(
             )
 
     return contract_address, setup_txs
+
 
 @pytest.mark.parametrize(
     "storage_action,tx_result",
@@ -338,7 +341,10 @@ def test_storage_access_cold(
     )
 
     loop_cost = (
-        gas_costs.G_COLD_SLOAD + storage_op_cost + bytecode_cost + loop_overhead
+        gas_costs.G_COLD_SLOAD
+        + storage_op_cost
+        + bytecode_cost
+        + loop_overhead
     )
 
     # The attack contract has dispatch logic at the start. Depending on
@@ -347,8 +353,8 @@ def test_storage_access_cold(
     # init mode is only used for the setup phase to initialize storage slots.
     # execution mode is used for the benchmarked storage accesses.
     #
-    # This separation is required since we can't do the initialization of storage
-    # slots in the contract creation code due to potential transaction gas limits.
+    # This separation is required since we can't do storage initialization
+    # in contract creation code due to potential transaction gas limits.
     prefix_cost = (
         gas_costs.G_BASE  # CALLDATASIZE
         + gas_costs.G_VERY_LOW * 3  # PUSH1 + EQ + PUSH2
@@ -366,11 +372,12 @@ def test_storage_access_cold(
     # Since calldata gas cost varies based on zero vs non-zero bytes,
     # we use worst-case intrinsic gas (all non-zero bytes) for calculations.
     #
-    # Exec calldata format: [start_slot (32 bytes), count (32 bytes)] = 64 bytes
+    # Exec calldata: [start_slot (32B), count (32B)] = 64 bytes
     # Worst case: 64 bytes * 16 gas = 1024 gas for calldata.
-    # The gas difference between average and worst case is negligible for our purposes.
+    # Gas difference between average and worst case is negligible.
     worst_intrinsic = intrinsic_gas_calc(
-        calldata=b"\xff" * EXEC_CALLDATA_SIZE, return_cost_deducted_prior_execution=True
+        calldata=b"\xff" * EXEC_CALLDATA_SIZE,
+        return_cost_deducted_prior_execution=True,
     )
 
     # How many slots can we access with gas_benchmark_value?
@@ -397,17 +404,20 @@ def test_storage_access_cold(
 
     for tx_index in range(num_exec_txs):
         start_slot = 1 + tx_index * max_slots_per_tx
-        is_last_tx = tx_index == num_exec_txs - 1
 
-        slots_in_tx = min(max_slots_per_tx, num_target_slots - tx_index * max_slots_per_tx)
+        slots_in_tx = min(
+            max_slots_per_tx, num_target_slots - tx_index * max_slots_per_tx
+        )
 
-        calldata = start_slot.to_bytes(32, "big") + slots_in_tx.to_bytes(32, "big")
+        calldata = start_slot.to_bytes(32, "big") + slots_in_tx.to_bytes(
+            32, "big"
+        )
         tx_intrinsic = intrinsic_gas_calc(
             calldata=calldata, return_cost_deducted_prior_execution=True
         )
 
-        # Calculate gas limit for this transaction
-        # For OOG: give gas for (slots - 1) to trigger OOG on last loop iteration.
+        # Calculate gas limit for this transaction.
+        # For OOG: give gas for (slots-1) to trigger OOG on last iteration.
         # Each tx runs out of gas, similar to how REVERT makes each tx revert.
         if tx_result == TransactionResult.OUT_OF_GAS:
             slots_for_gas = slots_in_tx - 1
@@ -415,8 +425,9 @@ def test_storage_access_cold(
             slots_for_gas = slots_in_tx
 
         tx_gas = tx_intrinsic + prefix_cost + loop_cost * slots_for_gas
+        is_last_tx = tx_index == num_exec_txs - 1
         if is_last_tx and tx_result == TransactionResult.REVERT:
-            tx_gas += suffix_cost
+            tx_gas += suffix_cost  # The REVERT(0, 0)
 
         total_gas_used += tx_gas
 
@@ -429,43 +440,28 @@ def test_storage_access_cold(
             )
         )
 
-    # -------------------------------------------------------------------------
-    # Step 6: Build expected post-state
-    # -------------------------------------------------------------------------
-
     # Determine expected storage values after execution.
-    # Key insight: init phase writes slot[i] = i for all slots.
-    # These values persist unless overwritten by a committed transaction.
+    # Recall init phase writes slot[i] = i for all slots.
     post = {}
     if not absent_slots:
-        # How many slots have "execution" values (vs init values)?
         if tx_result == TransactionResult.SUCCESS:
-            # All slots modified by execution
             slots_with_exec_values = num_target_slots
         else:
             # REVERT and OUT_OF_GAS: all txs revert, no exec values persist
             slots_with_exec_values = 0
 
-        # Build storage expectations
-        storage = {}
         if storage_action == StorageAction.WRITE_NEW_VALUE:
-            # Slots modified by execution have value -1 (0xff...ff)
-            for i in range(1, slots_with_exec_values + 1):
-                storage[i] = 2**256 - 1
-            # Remaining slots keep init value (slot[i] = i)
-            for i in range(slots_with_exec_values + 1, num_target_slots + 1):
-                storage[i] = i
+            # Executed slots have -1, remaining keep init value (slot[i] = i)
+            storage = {
+                i: (2**256 - 1 if i <= slots_with_exec_values else i)
+                for i in range(1, num_target_slots + 1)
+            }
         else:
             # READ or WRITE_SAME_VALUE: all slots have init value
-            for i in range(1, num_target_slots + 1):
-                storage[i] = i
+            storage = {i: i for i in range(1, num_target_slots + 1)}
 
         if storage:
             post = {contract_address: Account(storage=storage)}
-
-    # -------------------------------------------------------------------------
-    # Step 7: Execute benchmark
-    # -------------------------------------------------------------------------
 
     blocks = [Block(txs=setup_txs)]
     with TestPhaseManager.execution():
