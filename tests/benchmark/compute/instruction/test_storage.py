@@ -460,8 +460,7 @@ def test_storage_access_cold(
             # READ or WRITE_SAME_VALUE: all slots have init value
             storage = {i: i for i in range(1, num_target_slots + 1)}
 
-        if storage:
-            post = {contract_address: Account(storage=storage)}
+        post = {contract_address: Account(storage=storage)}
 
     blocks = [Block(txs=setup_txs)]
     with TestPhaseManager.execution():
