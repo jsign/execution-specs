@@ -220,19 +220,8 @@ def test_storage_access_cold(
         # Add an extra slot to make it run out-of-gas
         num_target_slots += 1
 
-    code_prefix = Op.PUSH4(num_target_slots) + Op.JUMPDEST
-    code_loop = execution_code_body + Op.JUMPI(
-        len(code_prefix) - 1,
-        Op.PUSH1(1) + Op.SWAP1 + Op.SUB + Op.DUP1 + Op.ISZERO + Op.ISZERO,
-    )
-    execution_code = code_prefix + code_loop
-
-    if tx_result == TransactionResult.REVERT:
-        execution_code += Op.REVERT(0, 0)
-    else:
-        execution_code += Op.STOP
-
-    execution_code_address = pre.deploy_contract(code=execution_code)
+    # Common loop condition: decrement counter, check if non-zero
+    loop_condition = Op.PUSH1(1) + Op.SWAP1 + Op.SUB + Op.DUP1 + Op.ISZERO + Op.ISZERO
 
     total_gas_used = (
         num_target_slots * loop_cost
@@ -243,10 +232,20 @@ def test_storage_access_cold(
 
     # Contract creation
     sender_addr = pre.fund_eoa()
+    contract_address = compute_create_address(address=sender_addr, nonce=0)
     setup_txs = []
 
     if absent_slots:
-        # No slot initialization needed - simple case
+        # No slot initialization needed - deploy execution code directly
+        code_prefix = Op.PUSH4(num_target_slots) + Op.JUMPDEST
+        code_loop = execution_code_body + Op.JUMPI(len(code_prefix) - 1, loop_condition)
+        execution_code = code_prefix + code_loop
+        if tx_result == TransactionResult.REVERT:
+            execution_code += Op.REVERT(0, 0)
+        else:
+            execution_code += Op.STOP
+
+        execution_code_address = pre.deploy_contract(code=execution_code)
         creation_code = (
             Op.EXTCODECOPY(
                 address=execution_code_address,
@@ -319,10 +318,8 @@ def test_storage_access_cold(
         # The loop's JUMPDEST will be at: prefix + init_loop + JUMPDEST + code_prefix
         execution_code_start = prefix_len + len(init_loop) + 1  # +1 for outer JUMPDEST
         adjusted_code_prefix = Op.PUSH4(num_target_slots) + Op.JUMPDEST
-        adjusted_code_loop = execution_code_body + Op.JUMPI(
-            execution_code_start + len(adjusted_code_prefix) - 1,
-            Op.PUSH1(1) + Op.SWAP1 + Op.SUB + Op.DUP1 + Op.ISZERO + Op.ISZERO,
-        )
+        adjusted_jump_target = execution_code_start + len(adjusted_code_prefix) - 1
+        adjusted_code_loop = execution_code_body + Op.JUMPI(adjusted_jump_target, loop_condition)
         adjusted_execution_code = adjusted_code_prefix + adjusted_code_loop
 
         if tx_result == TransactionResult.REVERT:
@@ -362,11 +359,6 @@ def test_storage_access_cold(
                 )
             )
 
-        # Calculate contract address before creating init transactions
-        contract_address = compute_create_address(
-            address=sender_addr, nonce=0
-        )
-
         # Calculate batch sizes and create init transactions
         # Use 90% of gas limit to leave margin for overhead
         max_slots_per_tx = (
@@ -395,8 +387,6 @@ def test_storage_access_cold(
 
     blocks = [Block(txs=setup_txs)]
 
-    contract_address = compute_create_address(address=sender_addr, nonce=0)
-
     with TestPhaseManager.execution():
         op_tx = Transaction(
             to=contract_address,
@@ -408,24 +398,12 @@ def test_storage_access_cold(
     # Post check: verify storage slots were initialized correctly
     post = {}
     if not absent_slots:
-        # Slots 1 to num_target_slots should be initialized
-        # Value depends on storage_action and tx_result
-        if (
-            storage_action == StorageAction.WRITE_NEW_VALUE
-            and tx_result == TransactionResult.SUCCESS
-        ):
-            # Execution wrote NOT(0) to all slots
-            expected_value = 2**256 - 1
-        else:
-            # Slots retain their initialized value (index)
-            # (READ doesn't change, WRITE_SAME_VALUE writes same, REVERT/OOG reverts)
-            expected_value = None  # Each slot has its index as value
-
-        if expected_value is not None:
-            storage = {i: expected_value for i in range(1, num_target_slots + 1)}
+        # Slots 1 to num_target_slots initialized to their index, unless
+        # WRITE_NEW_VALUE with SUCCESS overwrote them with NOT(0)
+        if storage_action == StorageAction.WRITE_NEW_VALUE and tx_result == TransactionResult.SUCCESS:
+            storage = {i: 2**256 - 1 for i in range(1, num_target_slots + 1)}
         else:
             storage = {i: i for i in range(1, num_target_slots + 1)}
-
         post = {contract_address: Account(storage=storage)}
 
     benchmark_test(
