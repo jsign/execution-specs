@@ -18,7 +18,6 @@ from execution_testing import (
     BenchmarkTestFiller,
     Block,
     Bytecode,
-    Environment,
     ExtCallGenerator,
     Fork,
     JumpLoopGenerator,
@@ -101,10 +100,10 @@ def _setup_cold_storage_contract(
     tx_gas_limit: int,
 ) -> tuple[Address, list[Transaction]]:
     """
-    Deploy a contract for cold storage benchmarking and optionally initialize slots.
+    Deploy a contract for cold storage benchmarking.
 
     The contract has two execution paths:
-    - If calldata present: run init loop to initialize slots from (start_slot, count)
+    - If calldata present: run init loop to initialize slots
     - If no calldata: run the execution code
 
     Returns the contract address and list of setup transactions.
@@ -113,7 +112,9 @@ def _setup_cold_storage_contract(
     intrinsic_gas_cost_calc = fork.transaction_intrinsic_cost_calculator()
 
     # Common loop condition: decrement counter, check if non-zero
-    loop_condition = Op.PUSH1(1) + Op.SWAP1 + Op.SUB + Op.DUP1 + Op.ISZERO + Op.ISZERO
+    loop_condition = (
+        Op.PUSH1(1) + Op.SWAP1 + Op.SUB + Op.DUP1 + Op.ISZERO + Op.ISZERO
+    )
 
     # Init loop code: reads (start_slot, count) from calldata
     init_loop = (
@@ -140,7 +141,9 @@ def _setup_cold_storage_contract(
     execution_offset = prefix_len + len(init_loop)
 
     # Execution code with adjusted jump target for embedding
-    execution_code_start = prefix_len + len(init_loop) + 1  # +1 for outer JUMPDEST
+    execution_code_start = (
+        prefix_len + len(init_loop) + 1
+    )  # +1 for outer JUMPDEST
     code_prefix = Op.PUSH4(num_target_slots) + Op.JUMPDEST
     jump_target = execution_code_start + len(code_prefix) - 1
     code_loop = execution_code_body + Op.JUMPI(jump_target, loop_condition)
@@ -162,15 +165,12 @@ def _setup_cold_storage_contract(
 
     # Deploy via EXTCODECOPY pattern
     contract_code_address = pre.deploy_contract(code=contract_code)
-    creation_code = (
-        Op.EXTCODECOPY(
-            address=contract_code_address,
-            dest_offset=0,
-            offset=0,
-            size=Op.EXTCODESIZE(contract_code_address),
-        )
-        + Op.RETURN(0, Op.MSIZE)
-    )
+    creation_code = Op.EXTCODECOPY(
+        address=contract_code_address,
+        dest_offset=0,
+        offset=0,
+        size=Op.EXTCODESIZE(contract_code_address),
+    ) + Op.RETURN(0, Op.MSIZE)
 
     sender_addr = pre.fund_eoa()
     contract_address = compute_create_address(address=sender_addr, nonce=0)
@@ -192,7 +192,8 @@ def _setup_cold_storage_contract(
             gas_costs.G_STORAGE_SET
             + gas_costs.G_COLD_SLOAD
             + gas_costs.G_JUMPDEST
-            + gas_costs.G_VERY_LOW * 12  # DUPs, SWAPs, PUSHs, SUB, ADD, ISZEROs
+            + gas_costs.G_VERY_LOW
+            * 12  # DUPs, SWAPs, PUSHs, SUB, ADD, ISZEROs
             + gas_costs.G_HIGH
         )
 
@@ -202,8 +203,12 @@ def _setup_cold_storage_contract(
 
         for i in range(math.ceil(num_target_slots / max_slots_per_tx)):
             start_slot = 1 + i * max_slots_per_tx
-            count = min(max_slots_per_tx, num_target_slots - i * max_slots_per_tx)
-            calldata = start_slot.to_bytes(32, "big") + count.to_bytes(32, "big")
+            count = min(
+                max_slots_per_tx, num_target_slots - i * max_slots_per_tx
+            )
+            calldata = start_slot.to_bytes(32, "big") + count.to_bytes(
+                32, "big"
+            )
 
             setup_txs.append(
                 Transaction(
@@ -283,9 +288,15 @@ def test_storage_access_cold(
     # Calculate loop cost based on storage action
     loop_cost = gas_costs.G_COLD_SLOAD  # All accesses are always cold
     if storage_action == StorageAction.WRITE_NEW_VALUE:
-        loop_cost += gas_costs.G_STORAGE_RESET if not absent_slots else gas_costs.G_STORAGE_SET
+        loop_cost += (
+            gas_costs.G_STORAGE_RESET
+            if not absent_slots
+            else gas_costs.G_STORAGE_SET
+        )
     elif storage_action == StorageAction.WRITE_SAME_VALUE:
-        loop_cost += gas_costs.G_STORAGE_SET if absent_slots else gas_costs.G_WARM_SLOAD
+        loop_cost += (
+            gas_costs.G_STORAGE_SET if absent_slots else gas_costs.G_WARM_SLOAD
+        )
 
     # Build execution code body based on storage action
     execution_code_body = Bytecode()
@@ -314,16 +325,26 @@ def test_storage_access_cold(
         + gas_costs.G_JUMPDEST  # outer JUMPDEST
     )
 
-    suffix_cost = gas_costs.G_VERY_LOW * 2 if tx_result == TransactionResult.REVERT else 0
+    suffix_cost = (
+        gas_costs.G_VERY_LOW * 2
+        if tx_result == TransactionResult.REVERT
+        else 0
+    )
 
     num_target_slots = (
-        gas_benchmark_value - intrinsic_gas_cost_calc() - prefix_cost - suffix_cost
+        gas_benchmark_value
+        - intrinsic_gas_cost_calc()
+        - prefix_cost
+        - suffix_cost
     ) // loop_cost
     if tx_result == TransactionResult.OUT_OF_GAS:
         num_target_slots += 1
 
     total_gas_used = (
-        num_target_slots * loop_cost + intrinsic_gas_cost_calc() + prefix_cost + suffix_cost
+        num_target_slots * loop_cost
+        + intrinsic_gas_cost_calc()
+        + prefix_cost
+        + suffix_cost
     )
 
     # Setup: deploy contract and initialize slots
@@ -355,8 +376,11 @@ def test_storage_access_cold(
     # Post check
     post = {}
     if not absent_slots:
-        if storage_action == StorageAction.WRITE_NEW_VALUE and tx_result == TransactionResult.SUCCESS:
-            storage = {i: 2**256 - 1 for i in range(1, num_target_slots + 1)}
+        if (
+            storage_action == StorageAction.WRITE_NEW_VALUE
+            and tx_result == TransactionResult.SUCCESS
+        ):
+            storage = dict.fromkeys(range(1, num_target_slots + 1), 2**256 - 1)
         else:
             storage = {i: i for i in range(1, num_target_slots + 1)}
         post = {contract_address: Account(storage=storage)}
@@ -364,7 +388,9 @@ def test_storage_access_cold(
     benchmark_test(
         blocks=blocks,
         expected_benchmark_gas_used=(
-            total_gas_used if tx_result != TransactionResult.OUT_OF_GAS else gas_benchmark_value
+            total_gas_used
+            if tx_result != TransactionResult.OUT_OF_GAS
+            else gas_benchmark_value
         ),
         post=post,
     )
@@ -382,9 +408,7 @@ def test_storage_access_warm(
     benchmark_test: BenchmarkTestFiller,
     pre: Alloc,
     storage_action: StorageAction,
-    fork: Fork,
     gas_benchmark_value: int,
-    env: Environment,
     tx_gas_limit: int,
 ) -> None:
     """
