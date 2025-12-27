@@ -192,17 +192,13 @@ def test_storage_access_cold(
 
     prefix_cost = (
         gas_costs.G_VERY_LOW  # Target slots push
+        # Init check prefix: CALLDATASIZE + ISZERO + PUSH2 + JUMPI + JUMPDEST
+        + gas_costs.G_BASE  # CALLDATASIZE
+        + gas_costs.G_VERY_LOW  # ISZERO
+        + gas_costs.G_VERY_LOW  # PUSH2
+        + gas_costs.G_HIGH  # JUMPI
+        + gas_costs.G_JUMPDEST  # outer JUMPDEST
     )
-    if not absent_slots:
-        # Additional cost for init check prefix in execution phase
-        # CALLDATASIZE + ISZERO + PUSH2 + JUMPI + JUMPDEST
-        prefix_cost += (
-            gas_costs.G_BASE  # CALLDATASIZE
-            + gas_costs.G_VERY_LOW  # ISZERO
-            + gas_costs.G_VERY_LOW  # PUSH2
-            + gas_costs.G_HIGH  # JUMPI
-            + gas_costs.G_JUMPDEST  # outer JUMPDEST
-        )
 
     suffix_cost = 0
     if tx_result == TransactionResult.REVERT:
@@ -235,41 +231,85 @@ def test_storage_access_cold(
     contract_address = compute_create_address(address=sender_addr, nonce=0)
     setup_txs = []
 
-    if absent_slots:
-        # No slot initialization needed - deploy execution code directly
-        code_prefix = Op.PUSH4(num_target_slots) + Op.JUMPDEST
-        code_loop = execution_code_body + Op.JUMPI(len(code_prefix) - 1, loop_condition)
-        execution_code = code_prefix + code_loop
-        if tx_result == TransactionResult.REVERT:
-            execution_code += Op.REVERT(0, 0)
-        else:
-            execution_code += Op.STOP
+    # Contract code has two paths:
+    # - If calldata present: run init loop to initialize slots from (start_slot, count)
+    # - If no calldata: run execution code
 
-        execution_code_address = pre.deploy_contract(code=execution_code)
-        creation_code = (
-            Op.EXTCODECOPY(
-                address=execution_code_address,
-                dest_offset=0,
-                offset=0,
-                size=Op.EXTCODESIZE(execution_code_address),
-            )
-            + Op.RETURN(0, Op.MSIZE)
+    # Init loop code: reads (start_slot, count) from calldata
+    init_loop = (
+        Op.CALLDATALOAD(0)  # start_slot
+        + Op.CALLDATALOAD(32)  # count
+        + While(
+            body=(
+                Op.DUP2  # [start_slot, count, start_slot]
+                + Op.DUP1  # [start_slot, start_slot, ...]
+                + Op.SSTORE  # [count, start_slot]
+                + Op.SWAP1  # [start_slot, count]
+                + Op.PUSH1(1)
+                + Op.ADD  # [start_slot+1, count]
+                + Op.SWAP1  # [count, start_slot+1]
+            ),
+            condition=Op.PUSH1(1)
+            + Op.SWAP1
+            + Op.SUB
+            + Op.DUP1
+            + Op.ISZERO
+            + Op.ISZERO,
         )
-        with TestPhaseManager.setup():
-            setup_txs.append(
-                Transaction(
-                    to=None,
-                    gas_limit=tx_gas_limit,
-                    data=creation_code,
-                    sender=sender_addr,
-                )
-            )
-    else:
-        # Deploy contract with init entry point, then batch initialize slots.
-        # Contract code has two paths:
-        # - If calldata present: run init loop from (start_slot, count)
-        # - If no calldata: run execution code
+        + Op.STOP
+    )
 
+    # Combined contract: init check + init code + execution code
+    # Jump to execution if no calldata
+    # Prefix: CALLDATASIZE + ISZERO + PUSH2 + JUMPI = 6 bytes
+    prefix_len = 6
+    execution_offset = prefix_len + len(init_loop)
+
+    # Execution code with adjusted jump target for embedding
+    execution_code_start = prefix_len + len(init_loop) + 1  # +1 for outer JUMPDEST
+    code_prefix = Op.PUSH4(num_target_slots) + Op.JUMPDEST
+    jump_target = execution_code_start + len(code_prefix) - 1
+    code_loop = execution_code_body + Op.JUMPI(jump_target, loop_condition)
+    execution_code = code_prefix + code_loop
+    if tx_result == TransactionResult.REVERT:
+        execution_code += Op.REVERT(0, 0)
+    else:
+        execution_code += Op.STOP
+
+    contract_code = (
+        Op.CALLDATASIZE
+        + Op.ISZERO
+        + Op.PUSH2(execution_offset)
+        + Op.JUMPI
+        + init_loop
+        + Op.JUMPDEST  # execution_start
+        + execution_code
+    )
+
+    # Deploy contract_code to a helper address, then use EXTCODECOPY
+    contract_code_address = pre.deploy_contract(code=contract_code)
+    creation_code = (
+        Op.EXTCODECOPY(
+            address=contract_code_address,
+            dest_offset=0,
+            offset=0,
+            size=Op.EXTCODESIZE(contract_code_address),
+        )
+        + Op.RETURN(0, Op.MSIZE)
+    )
+
+    with TestPhaseManager.setup():
+        setup_txs.append(
+            Transaction(
+                to=None,
+                gas_limit=tx_gas_limit,
+                data=creation_code,
+                sender=sender_addr,
+            )
+        )
+
+    # Create init transactions to initialize slots (only when not absent_slots)
+    if not absent_slots:
         # Gas cost per slot initialization (for batch size calculation)
         slot_init_loop_cost = (
             gas_costs.G_STORAGE_SET  # 20,000 - storing to empty slot
@@ -284,97 +324,16 @@ def test_storage_access_cold(
             + gas_costs.G_HIGH  # JUMPI
         )
 
-        # Init loop code: reads (start_slot, count) from calldata
-        init_loop = (
-            Op.CALLDATALOAD(0)  # start_slot
-            + Op.CALLDATALOAD(32)  # count
-            + While(
-                body=(
-                    Op.DUP2  # [start_slot, count, start_slot]
-                    + Op.DUP1  # [start_slot, start_slot, ...]
-                    + Op.SSTORE  # [count, start_slot]
-                    + Op.SWAP1  # [start_slot, count]
-                    + Op.PUSH1(1)
-                    + Op.ADD  # [start_slot+1, count]
-                    + Op.SWAP1  # [count, start_slot+1]
-                ),
-                condition=Op.PUSH1(1)
-                + Op.SWAP1
-                + Op.SUB
-                + Op.DUP1
-                + Op.ISZERO
-                + Op.ISZERO,
-            )
-            + Op.STOP
-        )
-
-        # Combined contract: init check + init code + execution code
-        # Jump to execution if no calldata
-        # Prefix: CALLDATASIZE + ISZERO + PUSH2 + JUMPI = 6 bytes
-        prefix_len = 6
-        execution_offset = prefix_len + len(init_loop)
-
-        # Rebuild execution_code with adjusted jump target for embedding
-        # The loop's JUMPDEST will be at: prefix + init_loop + JUMPDEST + code_prefix
-        execution_code_start = prefix_len + len(init_loop) + 1  # +1 for outer JUMPDEST
-        adjusted_code_prefix = Op.PUSH4(num_target_slots) + Op.JUMPDEST
-        adjusted_jump_target = execution_code_start + len(adjusted_code_prefix) - 1
-        adjusted_code_loop = execution_code_body + Op.JUMPI(adjusted_jump_target, loop_condition)
-        adjusted_execution_code = adjusted_code_prefix + adjusted_code_loop
-
-        if tx_result == TransactionResult.REVERT:
-            adjusted_execution_code += Op.REVERT(0, 0)
-        else:
-            adjusted_execution_code += Op.STOP
-
-        contract_code = (
-            Op.CALLDATASIZE
-            + Op.ISZERO
-            + Op.PUSH2(execution_offset)
-            + Op.JUMPI
-            + init_loop
-            + Op.JUMPDEST  # execution_start
-            + adjusted_execution_code
-        )
-
-        # Deploy contract_code to a helper address, then use EXTCODECOPY
-        contract_code_address = pre.deploy_contract(code=contract_code)
-        creation_code = (
-            Op.EXTCODECOPY(
-                address=contract_code_address,
-                dest_offset=0,
-                offset=0,
-                size=Op.EXTCODESIZE(contract_code_address),
-            )
-            + Op.RETURN(0, Op.MSIZE)
-        )
-
-        with TestPhaseManager.setup():
-            setup_txs.append(
-                Transaction(
-                    to=None,
-                    gas_limit=tx_gas_limit,
-                    data=creation_code,
-                    sender=sender_addr,
-                )
-            )
-
-        # Calculate batch sizes and create init transactions
         # Use 90% of gas limit to leave margin for overhead
         max_slots_per_tx = (
-            math.floor(tx_gas_limit * 0.9) - intrinsic_gas_cost_calc()
+            tx_gas_limit * 9 // 10 - intrinsic_gas_cost_calc()
         ) // slot_init_loop_cost
-        num_init_txs = math.ceil(num_target_slots / max_slots_per_tx)
 
-        for i in range(num_init_txs):
-            # Slots 1 to num_target_slots (matching execution loop which decrements from n to 1)
+        for i in range(math.ceil(num_target_slots / max_slots_per_tx)):
+            # Slots 1 to num_target_slots (execution loop decrements from n to 1)
             start_slot = 1 + i * max_slots_per_tx
             count = min(max_slots_per_tx, num_target_slots - i * max_slots_per_tx)
-
-            # Calldata: (start_slot, count) as 32-byte words
-            calldata = (
-                start_slot.to_bytes(32, "big") + count.to_bytes(32, "big")
-            )
+            calldata = start_slot.to_bytes(32, "big") + count.to_bytes(32, "big")
 
             setup_txs.append(
                 Transaction(
