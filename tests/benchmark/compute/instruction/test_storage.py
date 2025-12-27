@@ -253,11 +253,11 @@ def _setup_cold_storage_contract(
             TransactionResult.REVERT,
             id="SSTORE same value, revert",
         ),
-        # pytest.param(
-        #     StorageAction.WRITE_SAME_VALUE,
-        #     TransactionResult.OUT_OF_GAS,
-        #     id="SSTORE same value, out of gas",
-        # ),
+        pytest.param(
+            StorageAction.WRITE_SAME_VALUE,
+            TransactionResult.OUT_OF_GAS,
+            id="SSTORE same value, out of gas",
+        ),
         # pytest.param(
         #     StorageAction.WRITE_NEW_VALUE,
         #     TransactionResult.SUCCESS,
@@ -434,28 +434,36 @@ def test_storage_access_cold(
     with TestPhaseManager.execution():
         blocks.append(Block(txs=exec_txs))
 
-    # Post check: determine which slots have committed values
+    # Post check: determine storage values
+    # Key insight: init phase already wrote values to ALL slots (1 to num_target_slots).
+    # Even if exec tx reverts, init values persist.
     post = {}
     if not absent_slots:
-        # For REVERT/OUT_OF_GAS with multiple txs, only intermediate txs commit
-        if num_exec_txs > 1 and tx_result in (
-            TransactionResult.REVERT,
-            TransactionResult.OUT_OF_GAS,
-        ):
-            committed_slots = (num_exec_txs - 1) * max_slots_per_exec_tx
-        elif tx_result in (TransactionResult.REVERT, TransactionResult.OUT_OF_GAS):
-            committed_slots = 0
-        else:
-            committed_slots = num_target_slots
+        storage = {}
 
-        if committed_slots > 0:
-            if (
-                storage_action == StorageAction.WRITE_NEW_VALUE
-                and tx_result == TransactionResult.SUCCESS
-            ):
-                storage = dict.fromkeys(range(1, committed_slots + 1), 2**256 - 1)
-            else:
-                storage = {i: i for i in range(1, committed_slots + 1)}
+        # Calculate how many slots were modified by committed exec txs
+        if tx_result == TransactionResult.SUCCESS:
+            committed_exec_slots = num_target_slots
+        elif num_exec_txs > 1:
+            # Multi-tx REVERT/OOG: intermediate txs commit
+            committed_exec_slots = (num_exec_txs - 1) * max_slots_per_exec_tx
+        else:
+            # Single-tx REVERT/OOG: nothing commits from exec
+            committed_exec_slots = 0
+
+        # For WRITE_NEW_VALUE, committed exec slots have new values
+        if storage_action == StorageAction.WRITE_NEW_VALUE:
+            for i in range(1, committed_exec_slots + 1):
+                storage[i] = 2**256 - 1
+            # Remaining slots keep init values (slot[i] = i)
+            for i in range(committed_exec_slots + 1, num_target_slots + 1):
+                storage[i] = i
+        else:
+            # READ or SAME_VALUE: all slots have value i (from init, unchanged)
+            for i in range(1, num_target_slots + 1):
+                storage[i] = i
+
+        if storage:
             post = {contract_address: Account(storage=storage)}
 
     benchmark_test(
