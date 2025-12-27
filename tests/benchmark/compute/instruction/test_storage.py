@@ -90,13 +90,6 @@ def test_tstore(
     )
 
 
-# Calldata sizes for mode dispatch:
-# - Exec mode: 64 bytes (start_slot + count) - no padding for efficiency
-# - Init mode: 65 bytes (start_slot + count + padding) - not benchmarked
-INIT_CALLDATA_SIZE = 65
-EXEC_CALLDATA_SIZE = 64
-
-
 def _build_cold_storage_contract(
     execution_code_body: Bytecode,
     ends_with_revert: bool,
@@ -116,6 +109,9 @@ def _build_cold_storage_contract(
 
     Stack layout during loops: [count, current_slot]
     """
+    # Calldata sizes: exec=64 (slot+count), init=65 (+padding for dispatch)
+    init_calldata_size = 32 + 32 + 1
+
     # Shared bytecode components
     loop_condition = (
         Op.PUSH1(1) + Op.SWAP1 + Op.SUB + Op.DUP1 + Op.ISZERO + Op.ISZERO
@@ -161,7 +157,7 @@ def _build_cold_storage_contract(
     # Combined contract: dispatch + exec + init
     return (
         Op.CALLDATASIZE
-        + Op.PUSH1(INIT_CALLDATA_SIZE)
+        + Op.PUSH1(init_calldata_size)
         + Op.EQ
         + Op.PUSH2(init_offset)
         + Op.JUMPI
@@ -183,6 +179,8 @@ def _deploy_cold_storage_contract(
 
     Returns (contract_address, setup_transactions).
     """
+    init_calldata_size = 32 + 32 + 1  # slot + count + padding
+
     gas_costs = fork.gas_costs()
     intrinsic_calc = fork.transaction_intrinsic_cost_calculator()
 
@@ -190,7 +188,6 @@ def _deploy_cold_storage_contract(
         execution_code_body, ends_with_revert
     )
 
-    # Deploy using EXTCODECOPY pattern
     code_holder = pre.deploy_contract(code=contract_code)
     creation_code = Op.EXTCODECOPY(
         code_holder, 0, 0, Op.EXTCODESIZE(code_holder)
@@ -222,9 +219,11 @@ def _deploy_cold_storage_contract(
             + gas_costs.G_HIGH  # JUMPI
         )
 
-        worst_intrinsic = intrinsic_calc(calldata=b"\xff" * INIT_CALLDATA_SIZE)
+        worst_intrinsic = intrinsic_calc(calldata=b"\xff" * init_calldata_size)
         max_slots_per_tx = (
-            tx_gas_limit * 9 // 10 - worst_intrinsic
+            # Leave 10% buffer for other costs. Setup txs aren't benchmarked,
+            # so we can be conservative here.
+            math.floor(tx_gas_limit * 0.9) - worst_intrinsic
         ) // init_loop_gas
 
         num_init_txs = math.ceil(init_slot_count / max_slots_per_tx)
@@ -306,6 +305,11 @@ def test_storage_access_cold(
     (e.g., Osaka), execution is split across multiple transactions with
     different slot ranges.
     """
+    # Contract uses calldata size to dispatch: 64B = exec, 65B = init.
+    # Both receive (start_slot, count) in calldata, but init has 1 extra
+    # padding byte to differentiate the modes.
+    exec_calldata_size = 32 + 32
+
     gas_costs = fork.gas_costs()
     intrinsic_gas_calc = fork.transaction_intrinsic_cost_calculator()
 
@@ -376,7 +380,7 @@ def test_storage_access_cold(
     # Worst case: 64 bytes * 16 gas = 1024 gas for calldata.
     # Gas difference between average and worst case is negligible.
     worst_intrinsic = intrinsic_gas_calc(
-        calldata=b"\xff" * EXEC_CALLDATA_SIZE,
+        calldata=b"\xff" * exec_calldata_size,
         return_cost_deducted_prior_execution=True,
     )
 
