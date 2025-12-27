@@ -106,8 +106,6 @@ def _build_cold_storage_contract(
 
     Both modes read (start_slot, count) from calldata and loop count times,
     incrementing the slot number each iteration.
-
-    Stack layout during loops: [count, current_slot]
     """
     # Calldata sizes: exec=64 (slot+count), init=65 (+padding for dispatch)
     init_calldata_size = 32 + 32 + 1
@@ -119,14 +117,10 @@ def _build_cold_storage_contract(
     slot_increment = Op.SWAP1 + Op.PUSH1(1) + Op.ADD + Op.SWAP1
     calldata_load = Op.CALLDATALOAD(0) + Op.CALLDATALOAD(32)
 
-    # Init loop: SSTORE(slot, slot), increment slot
     init_loop_body = Op.DUP2 + Op.DUP1 + Op.SSTORE + slot_increment
-
-    # Exec loop: user-provided body, increment slot
     exec_loop_body = execution_code_body + slot_increment
 
-    # Calculate bytecode offsets
-    # Dispatch: CALLDATASIZE PUSH1(65) EQ PUSH2(init_offset) JUMPI = 8 bytes
+    # Dispatch: CALLDATASIZE PUSH1(65) EQ PUSH2(offset) JUMPI = 8 bytes
     dispatch_len = 8
     exec_loop_target = dispatch_len + len(calldata_load)
 
@@ -154,7 +148,7 @@ def _build_cold_storage_contract(
         + Op.STOP
     )
 
-    # Combined contract: dispatch + exec + init
+    # Contract: dispatch + exec + init
     return (
         Op.CALLDATASIZE
         + Op.PUSH1(init_calldata_size)
