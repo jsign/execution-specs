@@ -13,6 +13,7 @@ import math
 import pytest
 from execution_testing import (
     Account,
+    Address,
     Alloc,
     BenchmarkTestFiller,
     Block,
@@ -90,6 +91,132 @@ def test_tstore(
     )
 
 
+def _setup_cold_storage_contract(
+    pre: Alloc,
+    fork: Fork,
+    num_target_slots: int,
+    init_slots: bool,
+    execution_code_body: Bytecode,
+    tx_result: TransactionResult,
+    tx_gas_limit: int,
+) -> tuple[Address, list[Transaction]]:
+    """
+    Deploy a contract for cold storage benchmarking and optionally initialize slots.
+
+    The contract has two execution paths:
+    - If calldata present: run init loop to initialize slots from (start_slot, count)
+    - If no calldata: run the execution code
+
+    Returns the contract address and list of setup transactions.
+    """
+    gas_costs = fork.gas_costs()
+    intrinsic_gas_cost_calc = fork.transaction_intrinsic_cost_calculator()
+
+    # Common loop condition: decrement counter, check if non-zero
+    loop_condition = Op.PUSH1(1) + Op.SWAP1 + Op.SUB + Op.DUP1 + Op.ISZERO + Op.ISZERO
+
+    # Init loop code: reads (start_slot, count) from calldata
+    init_loop = (
+        Op.CALLDATALOAD(0)  # start_slot
+        + Op.CALLDATALOAD(32)  # count
+        + While(
+            body=(
+                Op.DUP2  # [start_slot, count, start_slot]
+                + Op.DUP1  # [start_slot, start_slot, ...]
+                + Op.SSTORE  # [count, start_slot]
+                + Op.SWAP1  # [start_slot, count]
+                + Op.PUSH1(1)
+                + Op.ADD  # [start_slot+1, count]
+                + Op.SWAP1  # [count, start_slot+1]
+            ),
+            condition=loop_condition,
+        )
+        + Op.STOP
+    )
+
+    # Combined contract: init check + init code + execution code
+    # Prefix: CALLDATASIZE + ISZERO + PUSH2 + JUMPI = 6 bytes
+    prefix_len = 6
+    execution_offset = prefix_len + len(init_loop)
+
+    # Execution code with adjusted jump target for embedding
+    execution_code_start = prefix_len + len(init_loop) + 1  # +1 for outer JUMPDEST
+    code_prefix = Op.PUSH4(num_target_slots) + Op.JUMPDEST
+    jump_target = execution_code_start + len(code_prefix) - 1
+    code_loop = execution_code_body + Op.JUMPI(jump_target, loop_condition)
+    execution_code = code_prefix + code_loop
+    if tx_result == TransactionResult.REVERT:
+        execution_code += Op.REVERT(0, 0)
+    else:
+        execution_code += Op.STOP
+
+    contract_code = (
+        Op.CALLDATASIZE
+        + Op.ISZERO
+        + Op.PUSH2(execution_offset)
+        + Op.JUMPI
+        + init_loop
+        + Op.JUMPDEST  # execution_start
+        + execution_code
+    )
+
+    # Deploy via EXTCODECOPY pattern
+    contract_code_address = pre.deploy_contract(code=contract_code)
+    creation_code = (
+        Op.EXTCODECOPY(
+            address=contract_code_address,
+            dest_offset=0,
+            offset=0,
+            size=Op.EXTCODESIZE(contract_code_address),
+        )
+        + Op.RETURN(0, Op.MSIZE)
+    )
+
+    sender_addr = pre.fund_eoa()
+    contract_address = compute_create_address(address=sender_addr, nonce=0)
+    setup_txs: list[Transaction] = []
+
+    with TestPhaseManager.setup():
+        setup_txs.append(
+            Transaction(
+                to=None,
+                gas_limit=tx_gas_limit,
+                data=creation_code,
+                sender=sender_addr,
+            )
+        )
+
+    # Create init transactions to initialize slots
+    if init_slots:
+        slot_init_loop_cost = (
+            gas_costs.G_STORAGE_SET
+            + gas_costs.G_COLD_SLOAD
+            + gas_costs.G_JUMPDEST
+            + gas_costs.G_VERY_LOW * 12  # DUPs, SWAPs, PUSHs, SUB, ADD, ISZEROs
+            + gas_costs.G_HIGH
+        )
+
+        max_slots_per_tx = (
+            tx_gas_limit * 9 // 10 - intrinsic_gas_cost_calc()
+        ) // slot_init_loop_cost
+
+        for i in range(math.ceil(num_target_slots / max_slots_per_tx)):
+            start_slot = 1 + i * max_slots_per_tx
+            count = min(max_slots_per_tx, num_target_slots - i * max_slots_per_tx)
+            calldata = start_slot.to_bytes(32, "big") + count.to_bytes(32, "big")
+
+            setup_txs.append(
+                Transaction(
+                    to=contract_address,
+                    gas_limit=tx_gas_limit,
+                    data=calldata,
+                    sender=pre.fund_eoa(),
+                )
+            )
+
+    return contract_address, setup_txs
+
+
 @pytest.mark.parametrize(
     "storage_action,tx_result",
     [
@@ -153,212 +280,81 @@ def test_storage_access_cold(
     gas_costs = fork.gas_costs()
     intrinsic_gas_cost_calc = fork.transaction_intrinsic_cost_calculator()
 
+    # Calculate loop cost based on storage action
     loop_cost = gas_costs.G_COLD_SLOAD  # All accesses are always cold
     if storage_action == StorageAction.WRITE_NEW_VALUE:
-        if not absent_slots:
-            loop_cost += gas_costs.G_STORAGE_RESET
-        else:
-            loop_cost += gas_costs.G_STORAGE_SET
+        loop_cost += gas_costs.G_STORAGE_RESET if not absent_slots else gas_costs.G_STORAGE_SET
     elif storage_action == StorageAction.WRITE_SAME_VALUE:
-        if absent_slots:
-            loop_cost += gas_costs.G_STORAGE_SET
-        else:
-            loop_cost += gas_costs.G_WARM_SLOAD
-    elif storage_action == StorageAction.READ:
-        loop_cost += 0  # Only G_COLD_SLOAD is charged
+        loop_cost += gas_costs.G_STORAGE_SET if absent_slots else gas_costs.G_WARM_SLOAD
 
-    # Contract code
+    # Build execution code body based on storage action
     execution_code_body = Bytecode()
     if storage_action == StorageAction.WRITE_SAME_VALUE:
-        # All the storage slots in the contract are initialized to their index.
-        # That is, storage slot `i` is initialized to `i`.
         execution_code_body = Op.SSTORE(Op.DUP1, Op.DUP1)
         loop_cost += gas_costs.G_VERY_LOW * 2
     elif storage_action == StorageAction.WRITE_NEW_VALUE:
-        # The new value 2^256-1 is guaranteed to be different from the initial
-        # value.
         execution_code_body = Op.SSTORE(Op.DUP2, Op.NOT(0))
         loop_cost += gas_costs.G_VERY_LOW * 3
     elif storage_action == StorageAction.READ:
         execution_code_body = Op.POP(Op.SLOAD(Op.DUP1))
         loop_cost += gas_costs.G_VERY_LOW + gas_costs.G_BASE
 
-    # Add costs jump-logic costs
+    # Add jump-logic costs
     loop_cost += (
-        gas_costs.G_JUMPDEST  # Prefix Jumpdest
+        gas_costs.G_JUMPDEST
         + gas_costs.G_VERY_LOW * 7  # ISZEROs, PUSHs, SWAPs, SUB, DUP
-        + gas_costs.G_HIGH  # JUMPI
+        + gas_costs.G_HIGH
     )
 
     prefix_cost = (
         gas_costs.G_VERY_LOW  # Target slots push
-        # Init check prefix: CALLDATASIZE + ISZERO + PUSH2 + JUMPI + JUMPDEST
         + gas_costs.G_BASE  # CALLDATASIZE
-        + gas_costs.G_VERY_LOW  # ISZERO
-        + gas_costs.G_VERY_LOW  # PUSH2
+        + gas_costs.G_VERY_LOW * 2  # ISZERO, PUSH2
         + gas_costs.G_HIGH  # JUMPI
         + gas_costs.G_JUMPDEST  # outer JUMPDEST
     )
 
-    suffix_cost = 0
-    if tx_result == TransactionResult.REVERT:
-        suffix_cost = (
-            gas_costs.G_VERY_LOW * 2  # Revert PUSHs
-        )
+    suffix_cost = gas_costs.G_VERY_LOW * 2 if tx_result == TransactionResult.REVERT else 0
 
     num_target_slots = (
-        gas_benchmark_value
-        - intrinsic_gas_cost_calc()
-        - prefix_cost
-        - suffix_cost
+        gas_benchmark_value - intrinsic_gas_cost_calc() - prefix_cost - suffix_cost
     ) // loop_cost
     if tx_result == TransactionResult.OUT_OF_GAS:
-        # Add an extra slot to make it run out-of-gas
         num_target_slots += 1
 
-    # Common loop condition: decrement counter, check if non-zero
-    loop_condition = Op.PUSH1(1) + Op.SWAP1 + Op.SUB + Op.DUP1 + Op.ISZERO + Op.ISZERO
-
     total_gas_used = (
-        num_target_slots * loop_cost
-        + intrinsic_gas_cost_calc()
-        + prefix_cost
-        + suffix_cost
+        num_target_slots * loop_cost + intrinsic_gas_cost_calc() + prefix_cost + suffix_cost
     )
 
-    # Contract creation
-    sender_addr = pre.fund_eoa()
-    contract_address = compute_create_address(address=sender_addr, nonce=0)
-    setup_txs = []
-
-    # Contract code has two paths:
-    # - If calldata present: run init loop to initialize slots from (start_slot, count)
-    # - If no calldata: run execution code
-
-    # Init loop code: reads (start_slot, count) from calldata
-    init_loop = (
-        Op.CALLDATALOAD(0)  # start_slot
-        + Op.CALLDATALOAD(32)  # count
-        + While(
-            body=(
-                Op.DUP2  # [start_slot, count, start_slot]
-                + Op.DUP1  # [start_slot, start_slot, ...]
-                + Op.SSTORE  # [count, start_slot]
-                + Op.SWAP1  # [start_slot, count]
-                + Op.PUSH1(1)
-                + Op.ADD  # [start_slot+1, count]
-                + Op.SWAP1  # [count, start_slot+1]
-            ),
-            condition=Op.PUSH1(1)
-            + Op.SWAP1
-            + Op.SUB
-            + Op.DUP1
-            + Op.ISZERO
-            + Op.ISZERO,
-        )
-        + Op.STOP
+    # Setup: deploy contract and initialize slots
+    contract_address, setup_txs = _setup_cold_storage_contract(
+        pre=pre,
+        fork=fork,
+        num_target_slots=num_target_slots,
+        init_slots=not absent_slots,
+        execution_code_body=execution_code_body,
+        tx_result=tx_result,
+        tx_gas_limit=tx_gas_limit,
     )
 
-    # Combined contract: init check + init code + execution code
-    # Jump to execution if no calldata
-    # Prefix: CALLDATASIZE + ISZERO + PUSH2 + JUMPI = 6 bytes
-    prefix_len = 6
-    execution_offset = prefix_len + len(init_loop)
-
-    # Execution code with adjusted jump target for embedding
-    execution_code_start = prefix_len + len(init_loop) + 1  # +1 for outer JUMPDEST
-    code_prefix = Op.PUSH4(num_target_slots) + Op.JUMPDEST
-    jump_target = execution_code_start + len(code_prefix) - 1
-    code_loop = execution_code_body + Op.JUMPI(jump_target, loop_condition)
-    execution_code = code_prefix + code_loop
-    if tx_result == TransactionResult.REVERT:
-        execution_code += Op.REVERT(0, 0)
-    else:
-        execution_code += Op.STOP
-
-    contract_code = (
-        Op.CALLDATASIZE
-        + Op.ISZERO
-        + Op.PUSH2(execution_offset)
-        + Op.JUMPI
-        + init_loop
-        + Op.JUMPDEST  # execution_start
-        + execution_code
-    )
-
-    # Deploy contract_code to a helper address, then use EXTCODECOPY
-    contract_code_address = pre.deploy_contract(code=contract_code)
-    creation_code = (
-        Op.EXTCODECOPY(
-            address=contract_code_address,
-            dest_offset=0,
-            offset=0,
-            size=Op.EXTCODESIZE(contract_code_address),
-        )
-        + Op.RETURN(0, Op.MSIZE)
-    )
-
-    with TestPhaseManager.setup():
-        setup_txs.append(
-            Transaction(
-                to=None,
-                gas_limit=tx_gas_limit,
-                data=creation_code,
-                sender=sender_addr,
-            )
-        )
-
-    # Create init transactions to initialize slots (only when not absent_slots)
-    if not absent_slots:
-        # Gas cost per slot initialization (for batch size calculation)
-        slot_init_loop_cost = (
-            gas_costs.G_STORAGE_SET  # 20,000 - storing to empty slot
-            + gas_costs.G_COLD_SLOAD  # 2,100 - cold access
-            + gas_costs.G_JUMPDEST  # 1
-            + gas_costs.G_VERY_LOW * 3  # DUPs
-            + gas_costs.G_VERY_LOW * 3  # SWAPs
-            + gas_costs.G_VERY_LOW * 2  # PUSHs
-            + gas_costs.G_VERY_LOW  # SUB
-            + gas_costs.G_VERY_LOW  # ADD
-            + gas_costs.G_VERY_LOW * 2  # ISZEROs
-            + gas_costs.G_HIGH  # JUMPI
-        )
-
-        # Use 90% of gas limit to leave margin for overhead
-        max_slots_per_tx = (
-            tx_gas_limit * 9 // 10 - intrinsic_gas_cost_calc()
-        ) // slot_init_loop_cost
-
-        for i in range(math.ceil(num_target_slots / max_slots_per_tx)):
-            # Slots 1 to num_target_slots (execution loop decrements from n to 1)
-            start_slot = 1 + i * max_slots_per_tx
-            count = min(max_slots_per_tx, num_target_slots - i * max_slots_per_tx)
-            calldata = start_slot.to_bytes(32, "big") + count.to_bytes(32, "big")
-
-            setup_txs.append(
-                Transaction(
-                    to=contract_address,
-                    gas_limit=tx_gas_limit,
-                    data=calldata,
-                    sender=pre.fund_eoa(),
-                )
-            )
-
+    # Execution phase
     blocks = [Block(txs=setup_txs)]
-
     with TestPhaseManager.execution():
-        op_tx = Transaction(
-            to=contract_address,
-            gas_limit=gas_benchmark_value,
-            sender=pre.fund_eoa(),
+        blocks.append(
+            Block(
+                txs=[
+                    Transaction(
+                        to=contract_address,
+                        gas_limit=gas_benchmark_value,
+                        sender=pre.fund_eoa(),
+                    )
+                ]
+            )
         )
-    blocks.append(Block(txs=[op_tx]))
 
-    # Post check: verify storage slots were initialized correctly
+    # Post check
     post = {}
     if not absent_slots:
-        # Slots 1 to num_target_slots initialized to their index, unless
-        # WRITE_NEW_VALUE with SUCCESS overwrote them with NOT(0)
         if storage_action == StorageAction.WRITE_NEW_VALUE and tx_result == TransactionResult.SUCCESS:
             storage = {i: 2**256 - 1 for i in range(1, num_target_slots + 1)}
         else:
@@ -367,11 +363,8 @@ def test_storage_access_cold(
 
     benchmark_test(
         blocks=blocks,
-        # skip_gas_used_validation=True,
         expected_benchmark_gas_used=(
-            total_gas_used
-            if tx_result != TransactionResult.OUT_OF_GAS
-            else gas_benchmark_value
+            total_gas_used if tx_result != TransactionResult.OUT_OF_GAS else gas_benchmark_value
         ),
         post=post,
     )
