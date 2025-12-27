@@ -90,72 +90,78 @@ def test_tstore(
     )
 
 
-def _setup_cold_storage_contract(
-    pre: Alloc,
-    fork: Fork,
-    init_slots_count: int,
+# =============================================================================
+# Cold Storage Benchmark - Helper Functions
+# =============================================================================
+
+# Calldata sizes for mode dispatch:
+# - Init mode:  64 bytes (start_slot + count)
+# - Exec mode:  65 bytes (start_slot + count + 1 padding byte)
+INIT_CALLDATA_SIZE = 64
+EXEC_CALLDATA_SIZE = 65
+
+
+def _calc_intrinsic_gas(calldata: bytes) -> int:
+    """
+    Calculate transaction intrinsic gas for calldata.
+
+    Uses standard calldata cost (4 gas/zero byte, 16/non-zero).
+    Does NOT apply EIP-7623 floor - we need exact gas matching.
+    """
+    calldata_cost = sum(4 if b == 0 else 16 for b in calldata)
+    return 21000 + calldata_cost
+
+
+def _build_cold_storage_contract(
     execution_code_body: Bytecode,
-    tx_result: TransactionResult,
-    tx_gas_limit: int,
-) -> tuple[Address, list[Transaction]]:
+    ends_with_revert: bool,
+) -> Bytecode:
     """
-    Deploy a contract for cold storage benchmarking.
+    Build contract bytecode for cold storage benchmarking.
 
-    The contract has two execution paths controlled by calldata size:
-    - CALLDATASIZE == 64: run init loop (setup phase)
-    - CALLDATASIZE != 64: run execution loop (benchmark phase, uses 65 bytes)
+    Contract has two modes controlled by calldata size:
+    - CALLDATASIZE == 64: Init mode - SSTORE(slot, slot) for each slot
+    - CALLDATASIZE != 64: Exec mode - run execution_code_body for each slot
 
-    Both paths read (start_slot, count) from calldata[0:64] and loop through slots.
-    Execution uses 65 bytes (64 + 1 padding) to distinguish from init's 64 bytes.
-    Returns the contract address and list of setup transactions.
+    Both modes read (start_slot, count) from calldata and loop count times,
+    incrementing the slot number each iteration.
+
+    Stack layout during loops: [count, current_slot]
     """
-    gas_costs = fork.gas_costs()
-    intrinsic_gas_cost_calc = fork.transaction_intrinsic_cost_calculator()
-
-    # Common loop condition: decrement counter, check if non-zero
+    # Shared bytecode components
     loop_condition = (
         Op.PUSH1(1) + Op.SWAP1 + Op.SUB + Op.DUP1 + Op.ISZERO + Op.ISZERO
     )
-
-    # Slot increment: SWAP1 PUSH1(1) ADD SWAP1
-    # Stack: [count, start_slot] → [count, start_slot+1]
     slot_increment = Op.SWAP1 + Op.PUSH1(1) + Op.ADD + Op.SWAP1
+    calldata_load = Op.CALLDATALOAD(0) + Op.CALLDATALOAD(32)
 
-    # Init loop body: SSTORE(slot, slot), then increment slot
-    init_loop_body = (
-        Op.DUP2  # [start_slot, count, start_slot]
-        + Op.DUP1  # [start_slot, start_slot, count, start_slot]
-        + Op.SSTORE  # storage[start_slot] = start_slot; [count, start_slot]
-        + slot_increment
+    # Init loop: SSTORE(slot, slot), increment slot
+    init_loop_body = Op.DUP2 + Op.DUP1 + Op.SSTORE + slot_increment
+
+    # Exec loop: user-provided body, increment slot
+    exec_loop_body = execution_code_body + slot_increment
+
+    # Calculate bytecode offsets
+    # Dispatch: CALLDATASIZE PUSH1(64) EQ PUSH2(init_offset) JUMPI = 8 bytes
+    dispatch_len = 8
+    exec_loop_target = dispatch_len + len(calldata_load)
+
+    # Build execution code
+    exec_suffix = Op.REVERT(0, 0) if ends_with_revert else Op.STOP
+    exec_code = (
+        calldata_load
+        + Op.JUMPDEST
+        + exec_loop_body
+        + Op.JUMPI(exec_loop_target, loop_condition)
+        + exec_suffix
     )
 
-    # Execution loop body: action + increment slot
-    execution_loop_body = execution_code_body + slot_increment
+    # Build init code (placed after exec code)
+    init_offset = dispatch_len + len(exec_code)
+    # +1 for first JUMPDEST
+    init_loop_target = init_offset + 1 + len(calldata_load)
 
-    # Build execution code (reads calldata, loops)
-    # Dispatch prefix: CALLDATASIZE PUSH1(64) EQ PUSH2(init_offset) JUMPI = 8 bytes
-    dispatch_prefix_len = 8
-
-    # Execution code layout:
-    # CALLDATALOAD(0) CALLDATALOAD(32) JUMPDEST <loop_body> JUMPI <suffix>
-    calldata_load = Op.CALLDATALOAD(0) + Op.CALLDATALOAD(32)  # 6 bytes
-    execution_loop_target = dispatch_prefix_len + len(calldata_load)
-
-    execution_loop = (
-        Op.JUMPDEST
-        + execution_loop_body
-        + Op.JUMPI(execution_loop_target, loop_condition)
-    )
-    if tx_result == TransactionResult.REVERT:
-        execution_code = calldata_load + execution_loop + Op.REVERT(0, 0)
-    else:
-        execution_code = calldata_load + execution_loop + Op.STOP
-
-    # Init code layout (after execution code)
-    init_offset = dispatch_prefix_len + len(execution_code)
-    init_loop_target = init_offset + 1 + len(calldata_load)  # +1 for JUMPDEST
-
-    init_loop = (
+    init_code = (
         Op.JUMPDEST
         + calldata_load
         + Op.JUMPDEST
@@ -164,64 +170,81 @@ def _setup_cold_storage_contract(
         + Op.STOP
     )
 
-    # Combined contract: dispatch + execution + init
-    contract_code = (
+    # Combined contract: dispatch + exec + init
+    return (
         Op.CALLDATASIZE
-        + Op.PUSH1(64)
+        + Op.PUSH1(INIT_CALLDATA_SIZE)
         + Op.EQ
         + Op.PUSH2(init_offset)
         + Op.JUMPI
-        # Fall through to execution
-        + execution_code
-        + init_loop
+        + exec_code
+        + init_code
     )
 
-    # Deploy via EXTCODECOPY pattern
-    contract_code_address = pre.deploy_contract(code=contract_code)
+
+def _deploy_cold_storage_contract(
+    pre: Alloc,
+    fork: Fork,
+    execution_code_body: Bytecode,
+    ends_with_revert: bool,
+    init_slot_count: int,
+    tx_gas_limit: int,
+) -> tuple[Address, list[Transaction]]:
+    """
+    Deploy cold storage contract and create init transactions.
+
+    Returns (contract_address, setup_transactions).
+    """
+    gas_costs = fork.gas_costs()
+    intrinsic_calc = fork.transaction_intrinsic_cost_calculator()
+
+    contract_code = _build_cold_storage_contract(
+        execution_code_body, ends_with_revert
+    )
+
+    # Deploy using EXTCODECOPY pattern
+    code_holder = pre.deploy_contract(code=contract_code)
     creation_code = Op.EXTCODECOPY(
-        address=contract_code_address,
-        dest_offset=0,
-        offset=0,
-        size=Op.EXTCODESIZE(contract_code_address),
+        code_holder, 0, 0, Op.EXTCODESIZE(code_holder)
     ) + Op.RETURN(0, Op.MSIZE)
 
-    sender_addr = pre.fund_eoa()
-    contract_address = compute_create_address(address=sender_addr, nonce=0)
-    setup_txs: list[Transaction] = []
+    sender = pre.fund_eoa()
+    contract_address = compute_create_address(address=sender, nonce=0)
 
+    setup_txs: list[Transaction] = []
     with TestPhaseManager.setup():
+        # Contract deployment tx
         setup_txs.append(
             Transaction(
                 to=None,
                 gas_limit=tx_gas_limit,
                 data=creation_code,
-                sender=sender_addr,
+                sender=sender,
             )
         )
 
-    # Create init transactions to initialize slots (uses 64-byte calldata)
-    if init_slots_count > 0:
-        slot_init_loop_cost = (
+    # Init transactions to populate storage slots
+    if init_slot_count > 0:
+        # Gas per init loop iteration
+        init_loop_gas = (
             gas_costs.G_STORAGE_SET
             + gas_costs.G_COLD_SLOAD
             + gas_costs.G_JUMPDEST
-            + gas_costs.G_VERY_LOW
-            * 12  # DUPs, SWAPs, PUSHs, SUB, ADD, ISZEROs
-            + gas_costs.G_HIGH
+            + gas_costs.G_VERY_LOW * 12  # DUPs, SWAPs, PUSHs, arithmetic
+            + gas_costs.G_HIGH  # JUMPI
         )
 
+        worst_intrinsic = intrinsic_calc(calldata=b"\xff" * INIT_CALLDATA_SIZE)
         max_slots_per_tx = (
-            tx_gas_limit * 9 // 10 - intrinsic_gas_cost_calc(calldata=b"\xff" * 64)
-        ) // slot_init_loop_cost
+            tx_gas_limit * 9 // 10 - worst_intrinsic
+        ) // init_loop_gas
 
-        for i in range(math.ceil(init_slots_count / max_slots_per_tx)):
-            start_slot = 1 + i * max_slots_per_tx
-            count = min(
-                max_slots_per_tx, init_slots_count - i * max_slots_per_tx
-            )
-            calldata = start_slot.to_bytes(32, "big") + count.to_bytes(
-                32, "big"
-            )
+        num_init_txs = math.ceil(init_slot_count / max_slots_per_tx)
+        for i in range(num_init_txs):
+            start = 1 + i * max_slots_per_tx
+            remaining = init_slot_count - i * max_slots_per_tx
+            count = min(max_slots_per_tx, remaining)
+            calldata = start.to_bytes(32, "big") + count.to_bytes(32, "big")
 
             setup_txs.append(
                 Transaction(
@@ -235,13 +258,16 @@ def _setup_cold_storage_contract(
     return contract_address, setup_txs
 
 
+# =============================================================================
+# Cold Storage Benchmark - Main Test
+# =============================================================================
+
+
 @pytest.mark.parametrize(
     "storage_action,tx_result",
     [
         pytest.param(
-            StorageAction.READ,
-            TransactionResult.SUCCESS,
-            id="SSLOAD",
+            StorageAction.READ, TransactionResult.SUCCESS, id="SSLOAD"
         ),
         pytest.param(
             StorageAction.WRITE_SAME_VALUE,
@@ -275,13 +301,7 @@ def _setup_cold_storage_contract(
         ),
     ],
 )
-@pytest.mark.parametrize(
-    "absent_slots",
-    [
-        True,
-        False,
-    ],
-)
+@pytest.mark.parametrize("absent_slots", [True, False])
 def test_storage_access_cold(
     benchmark_test: BenchmarkTestFiller,
     pre: Alloc,
@@ -295,132 +315,157 @@ def test_storage_access_cold(
     """
     Benchmark cold storage slot accesses.
 
-    For forks with tx gas limit cap, execution is split into multiple
-    transactions, each accessing different slot ranges to keep them cold.
+    Tests SLOAD/SSTORE on cold storage slots. Each slot is accessed exactly
+    once to ensure cold access costs. For forks with tx gas limit caps
+    (e.g., Osaka), execution is split across multiple transactions with
+    different slot ranges.
+
+    Test matrix:
+    - storage_action: READ (SLOAD), WRITE_SAME_VALUE, WRITE_NEW_VALUE
+    - absent_slots: True = slots never initialized, False = pre-initialized
+    - tx_result: SUCCESS, REVERT (all undone), OUT_OF_GAS (partial)
     """
     gas_costs = fork.gas_costs()
 
-    # Calculate loop cost based on storage action
-    # Stack during loop: [count, start_slot]
-    loop_cost = gas_costs.G_COLD_SLOAD  # All accesses are always cold
-    if storage_action == StorageAction.WRITE_NEW_VALUE:
-        loop_cost += (
-            gas_costs.G_STORAGE_RESET
-            if not absent_slots
-            else gas_costs.G_STORAGE_SET
-        )
-    elif storage_action == StorageAction.WRITE_SAME_VALUE:
-        loop_cost += (
-            gas_costs.G_STORAGE_SET if absent_slots else gas_costs.G_WARM_SLOAD
-        )
+    # -------------------------------------------------------------------------
+    # Step 1: Calculate gas costs per loop iteration
+    # -------------------------------------------------------------------------
 
-    # Build execution code body based on storage action
-    # Stack: [count, start_slot] - use DUP2 to access start_slot
-    execution_code_body = Bytecode()
-    if storage_action == StorageAction.WRITE_SAME_VALUE:
-        # DUP2 DUP1 SSTORE = SSTORE(slot, slot)
-        execution_code_body = Op.DUP2 + Op.DUP1 + Op.SSTORE
-        loop_cost += gas_costs.G_VERY_LOW * 2
-    elif storage_action == StorageAction.WRITE_NEW_VALUE:
-        # DUP2 NOT(0) SWAP1 SSTORE = SSTORE(slot, -1)
-        execution_code_body = Op.DUP2 + Op.NOT(0) + Op.SWAP1 + Op.SSTORE
-        loop_cost += gas_costs.G_VERY_LOW * 4
-    elif storage_action == StorageAction.READ:
-        # DUP2 SLOAD POP = SLOAD(slot), discard result
+    # All storage accesses are cold (2100 gas)
+    storage_access_cost = gas_costs.G_COLD_SLOAD
+
+    # Additional cost depends on storage action
+    if storage_action == StorageAction.READ:
+        # SLOAD only - no additional storage cost
+        storage_op_cost = 0
+        # Bytecode: DUP2 SLOAD POP (access slot, discard result)
         execution_code_body = Op.POP(Op.SLOAD(Op.DUP2))
-        loop_cost += gas_costs.G_VERY_LOW + gas_costs.G_BASE
+        bytecode_cost = gas_costs.G_VERY_LOW + gas_costs.G_BASE
 
-    # Add loop overhead costs:
-    # - JUMPDEST
-    # - slot_increment: SWAP1 PUSH1(1) ADD SWAP1 (4 ops)
-    # - loop_condition: PUSH1(1) SWAP1 SUB DUP1 ISZERO ISZERO (6 ops)
-    # - PUSH2(target) for JUMPI
-    # - JUMPI
-    loop_cost += (
+    elif storage_action == StorageAction.WRITE_SAME_VALUE:
+        # SSTORE same value: cold read + warm write (or cold if absent)
+        if absent_slots:
+            storage_op_cost = gas_costs.G_STORAGE_SET
+        else:
+            storage_op_cost = gas_costs.G_WARM_SLOAD
+        # Bytecode: DUP2 DUP1 SSTORE (write slot number to slot)
+        execution_code_body = Op.DUP2 + Op.DUP1 + Op.SSTORE
+        bytecode_cost = gas_costs.G_VERY_LOW * 2
+
+    elif storage_action == StorageAction.WRITE_NEW_VALUE:
+        # SSTORE new value: cold read + storage modification
+        if absent_slots:
+            storage_op_cost = gas_costs.G_STORAGE_SET
+        else:
+            storage_op_cost = gas_costs.G_STORAGE_RESET
+        # Bytecode: DUP2 NOT(0) SWAP1 SSTORE (write -1 to slot)
+        execution_code_body = Op.DUP2 + Op.NOT(0) + Op.SWAP1 + Op.SSTORE
+        bytecode_cost = gas_costs.G_VERY_LOW * 4
+
+    # Loop overhead per iteration:
+    # - JUMPDEST (1)
+    # - slot_increment: SWAP1 PUSH1 ADD SWAP1 (4 ops)
+    # - loop_condition: PUSH1 SWAP1 SUB DUP1 ISZERO ISZERO (6 ops)
+    # - PUSH2 for jump target (1 op)
+    # - JUMPI (1)
+    loop_overhead = (
         gas_costs.G_JUMPDEST
-        + gas_costs.G_VERY_LOW * 11  # 4 (increment) + 6 (condition) + 1 (PUSH2 target)
-        + gas_costs.G_HIGH
+        + gas_costs.G_VERY_LOW * 11  # 4 + 6 + 1 = 11 G_VERY_LOW ops
+        + gas_costs.G_HIGH  # JUMPI
     )
 
-    # Prefix cost (dispatch + calldata loads, NOT including first JUMPDEST):
-    # CALLDATASIZE PUSH1(64) EQ PUSH2(offset) JUMPI CALLDATALOAD(0) CALLDATALOAD(32)
-    # Note: JUMPDEST is counted in loop_cost, not here
+    loop_cost = (
+        storage_access_cost + storage_op_cost + bytecode_cost + loop_overhead
+    )
+
+    # -------------------------------------------------------------------------
+    # Step 2: Calculate prefix and suffix costs (one-time per transaction)
+    # -------------------------------------------------------------------------
+
+    # Dispatch + calldata load (before loop starts):
+    # CALLDATASIZE PUSH1 EQ PUSH2 JUMPI CALLDATALOAD(0) CALLDATALOAD(32)
     prefix_cost = (
         gas_costs.G_BASE  # CALLDATASIZE
-        + gas_costs.G_VERY_LOW * 3  # PUSH1(64) + EQ + PUSH2
+        + gas_costs.G_VERY_LOW * 3  # PUSH1 + EQ + PUSH2
         + gas_costs.G_HIGH  # JUMPI
-        + gas_costs.G_VERY_LOW * 4  # 2x PUSH + 2x CALLDATALOAD
+        + gas_costs.G_VERY_LOW * 4  # 2x (PUSH1 + CALLDATALOAD)
     )
 
-    suffix_cost = (
-        gas_costs.G_VERY_LOW * 2
-        if tx_result == TransactionResult.REVERT
-        else 0
+    # Suffix cost (REVERT only): PUSH1(0) PUSH1(0) REVERT
+    if tx_result == TransactionResult.REVERT:
+        suffix_cost = gas_costs.G_VERY_LOW * 2
+    else:
+        suffix_cost = 0
+
+    # -------------------------------------------------------------------------
+    # Step 3: Calculate number of slots to access
+    # -------------------------------------------------------------------------
+
+    # Estimate intrinsic for a typical execution calldata
+    typical_calldata = (
+        (1).to_bytes(32, "big") + (10000).to_bytes(32, "big") + b"\x00"
     )
+    typical_intrinsic = _calc_intrinsic_gas(typical_calldata)
 
-    # Helper to compute intrinsic cost for execution calldata
-    # Note: Uses standard calldata cost (not EIP-7623 floor) to match EVM behavior
-    def exec_intrinsic_for(calldata: bytes) -> int:
-        calldata_cost = sum(4 if b == 0 else 16 for b in calldata)
-        return 21000 + calldata_cost
-
-    # Calculate max slots per execution tx (with 10% safety margin)
-    # Use worst-case intrinsic estimate for safety margin calc
-    max_exec_intrinsic = exec_intrinsic_for(b"\xff" * 65)
-    max_slots_per_exec_tx = (
-        tx_gas_limit * 9 // 10 - max_exec_intrinsic - prefix_cost
-    ) // loop_cost
-
-    # Estimate intrinsic for target slots calculation (start=1, count ~= large)
-    est_calldata = (1).to_bytes(32, "big") + (10000).to_bytes(32, "big") + b"\x00"
-    est_intrinsic = exec_intrinsic_for(est_calldata)
+    # How many slots can we access with gas_benchmark_value?
     num_target_slots = (
-        gas_benchmark_value - est_intrinsic - prefix_cost - suffix_cost
+        gas_benchmark_value - typical_intrinsic - prefix_cost - suffix_cost
     ) // loop_cost
+
+    # For OUT_OF_GAS, we need one extra slot to trigger OOG
     if tx_result == TransactionResult.OUT_OF_GAS:
         num_target_slots += 1
 
-    # Setup: deploy contract and initialize slots
-    contract_address, setup_txs = _setup_cold_storage_contract(
+    # -------------------------------------------------------------------------
+    # Step 4: Deploy contract and initialize storage
+    # -------------------------------------------------------------------------
+
+    contract_address, setup_txs = _deploy_cold_storage_contract(
         pre=pre,
         fork=fork,
-        init_slots_count=num_target_slots if not absent_slots else 0,
         execution_code_body=execution_code_body,
-        tx_result=tx_result,
+        ends_with_revert=(tx_result == TransactionResult.REVERT),
+        init_slot_count=num_target_slots if not absent_slots else 0,
         tx_gas_limit=tx_gas_limit,
     )
 
-    # Build execution transactions (may need multiple for high gas values)
-    num_exec_txs = math.ceil(num_target_slots / max_slots_per_exec_tx)
+    # -------------------------------------------------------------------------
+    # Step 5: Build execution transactions
+    # -------------------------------------------------------------------------
+
+    # Calculate max slots per tx (with 10% safety margin)
+    worst_intrinsic = _calc_intrinsic_gas(b"\xff" * EXEC_CALLDATA_SIZE)
+    available_gas = tx_gas_limit * 9 // 10 - worst_intrinsic - prefix_cost
+    max_slots_per_tx = available_gas // loop_cost
+
+    num_exec_txs = math.ceil(num_target_slots / max_slots_per_tx)
     exec_txs: list[Transaction] = []
     total_gas_used = 0
 
-    for i in range(num_exec_txs):
-        start_slot = 1 + i * max_slots_per_exec_tx
-        is_last_tx = i == num_exec_txs - 1
+    for tx_index in range(num_exec_txs):
+        start_slot = 1 + tx_index * max_slots_per_tx
+        is_last_tx = tx_index == num_exec_txs - 1
 
+        # Last tx gets remaining slots; others get max_slots_per_tx
         if is_last_tx:
-            slots_in_tx = num_target_slots - i * max_slots_per_exec_tx
+            slots_in_tx = num_target_slots - tx_index * max_slots_per_tx
         else:
-            slots_in_tx = max_slots_per_exec_tx
+            slots_in_tx = max_slots_per_tx
 
-        # Build calldata: (start_slot, count, padding)
-        # Uses 65 bytes to distinguish from init's 64 bytes
+        # Calldata: (start_slot, count, padding_byte)
         calldata = (
             start_slot.to_bytes(32, "big")
             + slots_in_tx.to_bytes(32, "big")
-            + b"\x00"  # 1 byte padding
+            + b"\x00"
         )
+        tx_intrinsic = _calc_intrinsic_gas(calldata)
 
-        # Calculate gas for this transaction using actual calldata
-        tx_intrinsic = exec_intrinsic_for(calldata)
-
-        # For OOG, the last tx should NOT have enough gas for all iterations.
-        # We give gas for (slots_in_tx - 1) but tell contract to do slots_in_tx,
-        # causing OOG on the last iteration.
-        slots_for_gas = slots_in_tx
+        # Calculate gas limit for this transaction
+        # For OOG: give gas for (slots - 1) to trigger OOG on last iteration
         if is_last_tx and tx_result == TransactionResult.OUT_OF_GAS:
             slots_for_gas = slots_in_tx - 1
+        else:
+            slots_for_gas = slots_in_tx
 
         tx_gas = tx_intrinsic + prefix_cost + loop_cost * slots_for_gas
         if is_last_tx and tx_result == TransactionResult.REVERT:
@@ -437,51 +482,64 @@ def test_storage_access_cold(
             )
         )
 
-    # Execution phase
-    blocks = [Block(txs=setup_txs)]
-    with TestPhaseManager.execution():
-        blocks.append(Block(txs=exec_txs))
+    # -------------------------------------------------------------------------
+    # Step 6: Build expected post-state
+    # -------------------------------------------------------------------------
 
-    # Post check: determine storage values
-    # Key insight: init phase already wrote values to ALL slots (1 to num_target_slots).
-    # Even if exec tx reverts, init values persist.
+    # Determine expected storage values after execution.
+    # Key insight: init phase writes slot[i] = i for all slots.
+    # These values persist unless overwritten by a committed transaction.
     post = {}
     if not absent_slots:
-        storage = {}
-
-        # Calculate how many slots were modified by committed exec txs
+        # How many slots have "execution" values (vs init values)?
         if tx_result == TransactionResult.SUCCESS:
-            committed_exec_slots = num_target_slots
+            # All slots modified by execution
+            slots_with_exec_values = num_target_slots
         elif tx_result == TransactionResult.REVERT:
-            # REVERT is embedded in contract code, so ALL txs revert
-            committed_exec_slots = 0
+            # REVERT is in contract code, so ALL txs revert
+            slots_with_exec_values = 0
         elif num_exec_txs > 1:
-            # Multi-tx OOG: intermediate txs complete successfully
-            committed_exec_slots = (num_exec_txs - 1) * max_slots_per_exec_tx
+            # Multi-tx OOG: intermediate txs complete, last tx reverts
+            slots_with_exec_values = (num_exec_txs - 1) * max_slots_per_tx
         else:
-            # Single-tx OOG: nothing commits from exec
-            committed_exec_slots = 0
+            # Single-tx OOG: entire tx reverts
+            slots_with_exec_values = 0
 
-        # For WRITE_NEW_VALUE, committed exec slots have new values
+        # Build storage expectations
+        storage = {}
         if storage_action == StorageAction.WRITE_NEW_VALUE:
-            for i in range(1, committed_exec_slots + 1):
+            # Slots modified by execution have value -1 (0xff...ff)
+            for i in range(1, slots_with_exec_values + 1):
                 storage[i] = 2**256 - 1
-            # Remaining slots keep init values (slot[i] = i)
-            for i in range(committed_exec_slots + 1, num_target_slots + 1):
+            # Remaining slots keep init value (slot[i] = i)
+            for i in range(slots_with_exec_values + 1, num_target_slots + 1):
                 storage[i] = i
         else:
-            # READ or SAME_VALUE: all slots have value i (from init, unchanged)
+            # READ or WRITE_SAME_VALUE: all slots have init value
             for i in range(1, num_target_slots + 1):
                 storage[i] = i
 
         if storage:
             post = {contract_address: Account(storage=storage)}
 
+    # -------------------------------------------------------------------------
+    # Step 7: Execute benchmark
+    # -------------------------------------------------------------------------
+
+    blocks = [Block(txs=setup_txs)]
+    with TestPhaseManager.execution():
+        blocks.append(Block(txs=exec_txs))
+
     benchmark_test(
         blocks=blocks,
         expected_benchmark_gas_used=total_gas_used,
         post=post,
     )
+
+
+# =============================================================================
+# Warm Storage Benchmark
+# =============================================================================
 
 
 @pytest.mark.parametrize(
