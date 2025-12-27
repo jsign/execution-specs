@@ -258,21 +258,21 @@ def _setup_cold_storage_contract(
             TransactionResult.OUT_OF_GAS,
             id="SSTORE same value, out of gas",
         ),
-        # pytest.param(
-        #     StorageAction.WRITE_NEW_VALUE,
-        #     TransactionResult.SUCCESS,
-        #     id="SSTORE new value",
-        # ),
-        # pytest.param(
-        #     StorageAction.WRITE_NEW_VALUE,
-        #     TransactionResult.REVERT,
-        #     id="SSTORE new value, revert",
-        # ),
-        # pytest.param(
-        #     StorageAction.WRITE_NEW_VALUE,
-        #     TransactionResult.OUT_OF_GAS,
-        #     id="SSTORE new value, out of gas",
-        # ),
+        pytest.param(
+            StorageAction.WRITE_NEW_VALUE,
+            TransactionResult.SUCCESS,
+            id="SSTORE new value",
+        ),
+        pytest.param(
+            StorageAction.WRITE_NEW_VALUE,
+            TransactionResult.REVERT,
+            id="SSTORE new value, revert",
+        ),
+        pytest.param(
+            StorageAction.WRITE_NEW_VALUE,
+            TransactionResult.OUT_OF_GAS,
+            id="SSTORE new value, out of gas",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -452,11 +452,14 @@ def test_storage_access_cold(
         # Calculate how many slots were modified by committed exec txs
         if tx_result == TransactionResult.SUCCESS:
             committed_exec_slots = num_target_slots
+        elif tx_result == TransactionResult.REVERT:
+            # REVERT is embedded in contract code, so ALL txs revert
+            committed_exec_slots = 0
         elif num_exec_txs > 1:
-            # Multi-tx REVERT/OOG: intermediate txs commit
+            # Multi-tx OOG: intermediate txs complete successfully
             committed_exec_slots = (num_exec_txs - 1) * max_slots_per_exec_tx
         else:
-            # Single-tx REVERT/OOG: nothing commits from exec
+            # Single-tx OOG: nothing commits from exec
             committed_exec_slots = 0
 
         # For WRITE_NEW_VALUE, committed exec slots have new values
