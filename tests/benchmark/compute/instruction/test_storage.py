@@ -90,15 +90,11 @@ def test_tstore(
     )
 
 
-# =============================================================================
-# Cold Storage Benchmark - Helper Functions
-# =============================================================================
-
 # Calldata sizes for mode dispatch:
-# - Init mode:  64 bytes (start_slot + count)
-# - Exec mode:  65 bytes (start_slot + count + 1 padding byte)
-INIT_CALLDATA_SIZE = 64
-EXEC_CALLDATA_SIZE = 65
+# - Exec mode:  64 bytes (start_slot + count) - no padding for efficiency
+# - Init mode:  65 bytes (start_slot + count + 1 padding byte) - padding ok, not benchmarked
+INIT_CALLDATA_SIZE = 65
+EXEC_CALLDATA_SIZE = 64
 
 
 def _calc_intrinsic_gas(calldata: bytes) -> int:
@@ -120,8 +116,11 @@ def _build_cold_storage_contract(
     Build contract bytecode for cold storage benchmarking.
 
     Contract has two modes controlled by calldata size:
-    - CALLDATASIZE == 64: Init mode - SSTORE(slot, slot) for each slot
-    - CALLDATASIZE != 64: Exec mode - run execution_code_body for each slot
+    - CALLDATASIZE == 65: Init mode - SSTORE(slot, slot) for each slot
+    - CALLDATASIZE == 64: Exec mode - run execution_code_body for each slot
+
+    Exec mode uses 64 bytes (no padding) for efficiency since it's the benchmarked path.
+    Init mode uses 65 bytes (with padding) since setup efficiency doesn't matter.
 
     Both modes read (start_slot, count) from calldata and loop count times,
     incrementing the slot number each iteration.
@@ -142,7 +141,7 @@ def _build_cold_storage_contract(
     exec_loop_body = execution_code_body + slot_increment
 
     # Calculate bytecode offsets
-    # Dispatch: CALLDATASIZE PUSH1(64) EQ PUSH2(init_offset) JUMPI = 8 bytes
+    # Dispatch: CALLDATASIZE PUSH1(65) EQ PUSH2(init_offset) JUMPI = 8 bytes
     dispatch_len = 8
     exec_loop_target = dispatch_len + len(calldata_load)
 
@@ -244,7 +243,8 @@ def _deploy_cold_storage_contract(
             start = 1 + i * max_slots_per_tx
             remaining = init_slot_count - i * max_slots_per_tx
             count = min(max_slots_per_tx, remaining)
-            calldata = start.to_bytes(32, "big") + count.to_bytes(32, "big")
+            # Padding byte triggers init mode (65 bytes)
+            calldata = start.to_bytes(32, "big") + count.to_bytes(32, "big") + b"\x00"
 
             setup_txs.append(
                 Transaction(
@@ -256,12 +256,6 @@ def _deploy_cold_storage_contract(
             )
 
     return contract_address, setup_txs
-
-
-# =============================================================================
-# Cold Storage Benchmark - Main Test
-# =============================================================================
-
 
 @pytest.mark.parametrize(
     "storage_action,tx_result",
@@ -327,63 +321,49 @@ def test_storage_access_cold(
     """
     gas_costs = fork.gas_costs()
 
-    # -------------------------------------------------------------------------
-    # Step 1: Calculate gas costs per loop iteration
-    # -------------------------------------------------------------------------
-
-    # All storage accesses are cold (2100 gas)
-    storage_access_cost = gas_costs.G_COLD_SLOAD
-
-    # Additional cost depends on storage action
+    # Define `execution_code_body` based on storage_action, and corresponding
+    # gas costs per loop iteration.
     if storage_action == StorageAction.READ:
-        # SLOAD only - no additional storage cost
         storage_op_cost = 0
-        # Bytecode: DUP2 SLOAD POP (access slot, discard result)
         execution_code_body = Op.POP(Op.SLOAD(Op.DUP2))
         bytecode_cost = gas_costs.G_VERY_LOW + gas_costs.G_BASE
-
     elif storage_action == StorageAction.WRITE_SAME_VALUE:
-        # SSTORE same value: cold read + warm write (or cold if absent)
         if absent_slots:
             storage_op_cost = gas_costs.G_STORAGE_SET
         else:
             storage_op_cost = gas_costs.G_WARM_SLOAD
-        # Bytecode: DUP2 DUP1 SSTORE (write slot number to slot)
         execution_code_body = Op.DUP2 + Op.DUP1 + Op.SSTORE
         bytecode_cost = gas_costs.G_VERY_LOW * 2
-
     elif storage_action == StorageAction.WRITE_NEW_VALUE:
-        # SSTORE new value: cold read + storage modification
         if absent_slots:
             storage_op_cost = gas_costs.G_STORAGE_SET
         else:
             storage_op_cost = gas_costs.G_STORAGE_RESET
-        # Bytecode: DUP2 NOT(0) SWAP1 SSTORE (write -1 to slot)
         execution_code_body = Op.DUP2 + Op.NOT(0) + Op.SWAP1 + Op.SSTORE
         bytecode_cost = gas_costs.G_VERY_LOW * 4
 
-    # Loop overhead per iteration:
-    # - JUMPDEST (1)
-    # - slot_increment: SWAP1 PUSH1 ADD SWAP1 (4 ops)
-    # - loop_condition: PUSH1 SWAP1 SUB DUP1 ISZERO ISZERO (6 ops)
-    # - PUSH2 for jump target (1 op)
-    # - JUMPI (1)
+    # Costs related to loop control flow i.e. iterator condition checking.
     loop_overhead = (
         gas_costs.G_JUMPDEST
-        + gas_costs.G_VERY_LOW * 11  # 4 + 6 + 1 = 11 G_VERY_LOW ops
+        # 4 (slot_increment: SWAP1, PUSH1, ADD, SWAP1)
+        # + 6 (loop_condition: PUSH1, SWAP1, SUB, DUP1, ISZERO, ISZERO)
+        # + 1 (PUSH2 for JUMPI target)
+        + gas_costs.G_VERY_LOW * 11
         + gas_costs.G_HIGH  # JUMPI
     )
 
     loop_cost = (
-        storage_access_cost + storage_op_cost + bytecode_cost + loop_overhead
+        gas_costs.G_COLD_SLOAD + storage_op_cost + bytecode_cost + loop_overhead
     )
 
-    # -------------------------------------------------------------------------
-    # Step 2: Calculate prefix and suffix costs (one-time per transaction)
-    # -------------------------------------------------------------------------
-
-    # Dispatch + calldata load (before loop starts):
-    # CALLDATASIZE PUSH1 EQ PUSH2 JUMPI CALLDATALOAD(0) CALLDATALOAD(32)
+    # The attack contract has dispatch logic at the start. Depending on
+    # the CALLDATASIZE, it jumps to either init or execution mode.
+    #
+    # init mode is only used for the setup phase to initialize storage slots.
+    # execution mode is used for the benchmarked storage accesses.
+    #
+    # This separation is required since we can't do the initialization of storage
+    # slots in the contract creation code due to potential transaction gas limits.
     prefix_cost = (
         gas_costs.G_BASE  # CALLDATASIZE
         + gas_costs.G_VERY_LOW * 3  # PUSH1 + EQ + PUSH2
@@ -391,34 +371,25 @@ def test_storage_access_cold(
         + gas_costs.G_VERY_LOW * 4  # 2x (PUSH1 + CALLDATALOAD)
     )
 
-    # Suffix cost (REVERT only): PUSH1(0) PUSH1(0) REVERT
+    # Suffix cost (REVERT only): REVERT(0, 0)
     if tx_result == TransactionResult.REVERT:
         suffix_cost = gas_costs.G_VERY_LOW * 2
     else:
         suffix_cost = 0
 
-    # -------------------------------------------------------------------------
-    # Step 3: Calculate number of slots to access
-    # -------------------------------------------------------------------------
-
-    # Estimate intrinsic for a typical execution calldata
-    typical_calldata = (
-        (1).to_bytes(32, "big") + (10000).to_bytes(32, "big") + b"\x00"
-    )
-    typical_intrinsic = _calc_intrinsic_gas(typical_calldata)
+    # The attack txs use calldata to signal start_slot and count.
+    # Since calldata gas cost varies based on zero vs non-zero bytes,
+    # we use worst-case intrinsic gas (all non-zero bytes) for calculations.
+    #
+    # Exec calldata format: [start_slot (32 bytes), count (32 bytes)] = 64 bytes
+    # Worst case: 64 bytes * 16 gas = 1024 gas for calldata.
+    # The gas difference between average and worst case is negligible for our purposes.
+    worst_intrinsic = _calc_intrinsic_gas(b"\xff" * EXEC_CALLDATA_SIZE)
 
     # How many slots can we access with gas_benchmark_value?
     num_target_slots = (
-        gas_benchmark_value - typical_intrinsic - prefix_cost - suffix_cost
+        gas_benchmark_value - worst_intrinsic - prefix_cost - suffix_cost
     ) // loop_cost
-
-    # For OUT_OF_GAS, we need one extra slot to trigger OOG
-    if tx_result == TransactionResult.OUT_OF_GAS:
-        num_target_slots += 1
-
-    # -------------------------------------------------------------------------
-    # Step 4: Deploy contract and initialize storage
-    # -------------------------------------------------------------------------
 
     contract_address, setup_txs = _deploy_cold_storage_contract(
         pre=pre,
@@ -429,13 +400,8 @@ def test_storage_access_cold(
         tx_gas_limit=tx_gas_limit,
     )
 
-    # -------------------------------------------------------------------------
-    # Step 5: Build execution transactions
-    # -------------------------------------------------------------------------
-
-    # Calculate max slots per tx (with 10% safety margin)
-    worst_intrinsic = _calc_intrinsic_gas(b"\xff" * EXEC_CALLDATA_SIZE)
-    available_gas = tx_gas_limit * 9 // 10 - worst_intrinsic - prefix_cost
+    # Calculate max slots per tx
+    available_gas = tx_gas_limit - worst_intrinsic - prefix_cost
     max_slots_per_tx = available_gas // loop_cost
 
     num_exec_txs = math.ceil(num_target_slots / max_slots_per_tx)
@@ -452,17 +418,14 @@ def test_storage_access_cold(
         else:
             slots_in_tx = max_slots_per_tx
 
-        # Calldata: (start_slot, count, padding_byte)
-        calldata = (
-            start_slot.to_bytes(32, "big")
-            + slots_in_tx.to_bytes(32, "big")
-            + b"\x00"
-        )
+        # Calldata: (start_slot, count) - no padding for exec mode (64 bytes)
+        calldata = start_slot.to_bytes(32, "big") + slots_in_tx.to_bytes(32, "big")
         tx_intrinsic = _calc_intrinsic_gas(calldata)
 
         # Calculate gas limit for this transaction
-        # For OOG: give gas for (slots - 1) to trigger OOG on last iteration
-        if is_last_tx and tx_result == TransactionResult.OUT_OF_GAS:
+        # For OOG: give gas for (slots - 1) to trigger OOG on last loop iteration.
+        # Each tx runs out of gas, similar to how REVERT makes each tx revert.
+        if tx_result == TransactionResult.OUT_OF_GAS:
             slots_for_gas = slots_in_tx - 1
         else:
             slots_for_gas = slots_in_tx
@@ -495,14 +458,8 @@ def test_storage_access_cold(
         if tx_result == TransactionResult.SUCCESS:
             # All slots modified by execution
             slots_with_exec_values = num_target_slots
-        elif tx_result == TransactionResult.REVERT:
-            # REVERT is in contract code, so ALL txs revert
-            slots_with_exec_values = 0
-        elif num_exec_txs > 1:
-            # Multi-tx OOG: intermediate txs complete, last tx reverts
-            slots_with_exec_values = (num_exec_txs - 1) * max_slots_per_tx
         else:
-            # Single-tx OOG: entire tx reverts
+            # REVERT and OUT_OF_GAS: all txs revert, no exec values persist
             slots_with_exec_values = 0
 
         # Build storage expectations
@@ -535,11 +492,6 @@ def test_storage_access_cold(
         expected_benchmark_gas_used=total_gas_used,
         post=post,
     )
-
-
-# =============================================================================
-# Warm Storage Benchmark
-# =============================================================================
 
 
 @pytest.mark.parametrize(
