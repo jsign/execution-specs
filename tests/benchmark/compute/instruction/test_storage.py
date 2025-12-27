@@ -414,7 +414,15 @@ def test_storage_access_cold(
 
         # Calculate gas for this transaction using actual calldata
         tx_intrinsic = exec_intrinsic_for(calldata)
-        tx_gas = tx_intrinsic + prefix_cost + loop_cost * slots_in_tx
+
+        # For OOG, the last tx should NOT have enough gas for all iterations.
+        # We give gas for (slots_in_tx - 1) but tell contract to do slots_in_tx,
+        # causing OOG on the last iteration.
+        slots_for_gas = slots_in_tx
+        if is_last_tx and tx_result == TransactionResult.OUT_OF_GAS:
+            slots_for_gas = slots_in_tx - 1
+
+        tx_gas = tx_intrinsic + prefix_cost + loop_cost * slots_for_gas
         if is_last_tx and tx_result == TransactionResult.REVERT:
             tx_gas += suffix_cost
 
@@ -468,11 +476,7 @@ def test_storage_access_cold(
 
     benchmark_test(
         blocks=blocks,
-        expected_benchmark_gas_used=(
-            total_gas_used
-            if tx_result != TransactionResult.OUT_OF_GAS
-            else gas_benchmark_value
-        ),
+        expected_benchmark_gas_used=total_gas_used,
         post=post,
     )
 
