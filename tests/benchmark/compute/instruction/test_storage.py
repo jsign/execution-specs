@@ -97,17 +97,6 @@ INIT_CALLDATA_SIZE = 65
 EXEC_CALLDATA_SIZE = 64
 
 
-def _calc_intrinsic_gas(calldata: bytes) -> int:
-    """
-    Calculate transaction intrinsic gas for calldata.
-
-    Uses standard calldata cost (4 gas/zero byte, 16/non-zero).
-    Does NOT apply EIP-7623 floor - we need exact gas matching.
-    """
-    calldata_cost = sum(4 if b == 0 else 16 for b in calldata)
-    return 21000 + calldata_cost
-
-
 def _build_cold_storage_contract(
     execution_code_body: Bytecode,
     ends_with_revert: bool,
@@ -313,13 +302,9 @@ def test_storage_access_cold(
     once to ensure cold access costs. For forks with tx gas limit caps
     (e.g., Osaka), execution is split across multiple transactions with
     different slot ranges.
-
-    Test matrix:
-    - storage_action: READ (SLOAD), WRITE_SAME_VALUE, WRITE_NEW_VALUE
-    - absent_slots: True = slots never initialized, False = pre-initialized
-    - tx_result: SUCCESS, REVERT (all undone), OUT_OF_GAS (partial)
     """
     gas_costs = fork.gas_costs()
+    intrinsic_gas_calc = fork.transaction_intrinsic_cost_calculator()
 
     # Define `execution_code_body` based on storage_action, and corresponding
     # gas costs per loop iteration.
@@ -384,7 +369,9 @@ def test_storage_access_cold(
     # Exec calldata format: [start_slot (32 bytes), count (32 bytes)] = 64 bytes
     # Worst case: 64 bytes * 16 gas = 1024 gas for calldata.
     # The gas difference between average and worst case is negligible for our purposes.
-    worst_intrinsic = _calc_intrinsic_gas(b"\xff" * EXEC_CALLDATA_SIZE)
+    worst_intrinsic = intrinsic_gas_calc(
+        calldata=b"\xff" * EXEC_CALLDATA_SIZE, return_cost_deducted_prior_execution=True
+    )
 
     # How many slots can we access with gas_benchmark_value?
     num_target_slots = (
@@ -412,15 +399,12 @@ def test_storage_access_cold(
         start_slot = 1 + tx_index * max_slots_per_tx
         is_last_tx = tx_index == num_exec_txs - 1
 
-        # Last tx gets remaining slots; others get max_slots_per_tx
-        if is_last_tx:
-            slots_in_tx = num_target_slots - tx_index * max_slots_per_tx
-        else:
-            slots_in_tx = max_slots_per_tx
+        slots_in_tx = min(max_slots_per_tx, num_target_slots - tx_index * max_slots_per_tx)
 
-        # Calldata: (start_slot, count) - no padding for exec mode (64 bytes)
         calldata = start_slot.to_bytes(32, "big") + slots_in_tx.to_bytes(32, "big")
-        tx_intrinsic = _calc_intrinsic_gas(calldata)
+        tx_intrinsic = intrinsic_gas_calc(
+            calldata=calldata, return_cost_deducted_prior_execution=True
+        )
 
         # Calculate gas limit for this transaction
         # For OOG: give gas for (slots - 1) to trigger OOG on last loop iteration.
