@@ -357,6 +357,11 @@ class T8N(Load):
         """
         block_env = self.block_environment()
         block_output = self.fork.BlockOutput()
+
+        # Enable witness mode for Osaka+ forks
+        if hasattr(self.fork, "enable_witness_mode"):
+            self.fork.enable_witness_mode(block_env.state)
+
         self.backup_state()
         if len(self.txs.transactions) > 0:
             tx = self.txs.transactions[0]
@@ -447,6 +452,10 @@ class T8N(Load):
         """
         block_env = self.block_environment()
         block_output = self.fork.BlockOutput()
+
+        # Enable witness mode for Osaka+ forks
+        if hasattr(self.fork, "enable_witness_mode"):
+            self.fork.enable_witness_mode(block_env.state)
 
         try:
             self._run_blockchain_test(block_env, block_output)

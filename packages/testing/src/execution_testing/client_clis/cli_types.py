@@ -25,6 +25,7 @@ from execution_testing.exceptions import (
     TransactionException,
     UndefinedException,
 )
+from execution_testing.fixtures.blockchain import ExecutionWitness
 from execution_testing.logging import (
     get_logger,
 )
@@ -289,6 +290,7 @@ class Result(CamelModel):
     ] = None
     traces: Traces | None = None
     opcode_count: OpcodeCount | None = None
+    execution_witness: ExecutionWitness | None = None
 
 
 TRaw = TypeVar("TRaw")

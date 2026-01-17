@@ -24,7 +24,45 @@ from ethereum_types.frozen import modify
 from ethereum_types.numeric import U256, Uint
 
 from .fork_types import EMPTY_ACCOUNT, Account, Address, Root
-from .trie import EMPTY_TRIE_ROOT, Trie, copy_trie, root, trie_get, trie_set
+from .trie import (
+    EMPTY_TRIE_ROOT,
+    IncrementalMPT,
+    Trie,
+    Witness,
+    build_mpt,
+    copy_trie,
+    mpt_get,
+    mpt_root,
+    mpt_set,
+    root,
+    trie_get,
+    trie_set,
+)
+
+
+@dataclass
+class WitnessState:
+    """
+    Tracks state for deferred execution witness generation.
+
+    Instead of recording witness nodes during execution, we preserve the
+    pre-block state and track which keys are accessed (reads) and modified
+    (writes). The witness is generated after all block execution by building
+    a fresh IncrementalMPT from the pre-block state, traversing read paths,
+    and applying the final diff for writes.
+    """
+
+    # Pre-block state (preserved at enable_witness_mode time)
+    pre_block_main_trie_data: Dict[Address, Optional[Account]]
+    pre_block_storage_tries_data: Dict[Address, Dict[Bytes32, U256]]
+
+    # Dirty tracking during execution (writes)
+    dirty_accounts: Set[Address] = field(default_factory=set)
+    dirty_storage: Dict[Address, Set[Bytes32]] = field(default_factory=dict)
+
+    # Access tracking during execution (reads)
+    accessed_accounts: Set[Address] = field(default_factory=set)
+    accessed_storage: Dict[Address, Set[Bytes32]] = field(default_factory=dict)
 
 
 @dataclass
@@ -46,6 +84,7 @@ class State:
         ]
     ] = field(default_factory=list)
     created_accounts: Set[Address] = field(default_factory=set)
+    _witness_state: Optional[WitnessState] = None
 
 
 @dataclass
@@ -70,6 +109,7 @@ def close_state(state: State) -> None:
     del state._storage_tries
     del state._snapshots
     del state.created_accounts
+    del state._witness_state
 
 
 def begin_transaction(
@@ -135,6 +175,11 @@ def rollback_transaction(
     transient_storage : TransientStorage
         The transient storage of the transaction.
 
+    Note: Dirty tracking for witness generation persists across rollbacks.
+    This is correct because the witness needs to capture all nodes that
+    were accessed during execution, regardless of whether transactions
+    succeeded or failed.
+
     """
     state._main_trie, state._storage_tries = state._snapshots.pop()
     if not state._snapshots:
@@ -189,8 +234,11 @@ def get_account_optional(state: State, address: Address) -> Optional[Account]:
         Account at address.
 
     """
-    account = trie_get(state._main_trie, address)
-    return account
+    # Track accessed account for execution witness generation
+    if state._witness_state is not None:
+        state._witness_state.accessed_accounts.add(address)
+
+    return trie_get(state._main_trie, address)
 
 
 def set_account(
@@ -211,6 +259,10 @@ def set_account(
 
     """
     trie_set(state._main_trie, address, account)
+
+    # Track dirty account for deferred witness generation
+    if state._witness_state is not None:
+        state._witness_state.dirty_accounts.add(address)
 
 
 def destroy_account(state: State, address: Address) -> None:
@@ -245,6 +297,17 @@ def destroy_storage(state: State, address: Address) -> None:
         Address of account whose storage is to be deleted.
 
     """
+    # Track all pre-block storage keys as dirty for witness generation
+    if state._witness_state is not None:
+        ws = state._witness_state
+        if address in ws.pre_block_storage_tries_data:
+            if address not in ws.dirty_storage:
+                ws.dirty_storage[address] = set()
+            # Mark all pre-block storage keys as dirty (they're now deleted)
+            ws.dirty_storage[address].update(
+                ws.pre_block_storage_tries_data[address].keys()
+            )
+
     if address in state._storage_tries:
         del state._storage_tries[address]
 
@@ -291,12 +354,17 @@ def get_storage(state: State, address: Address, key: Bytes32) -> U256:
         Value at the key.
 
     """
+    # Track accessed storage for execution witness generation
+    if state._witness_state is not None:
+        ws = state._witness_state
+        if address not in ws.accessed_storage:
+            ws.accessed_storage[address] = set()
+        ws.accessed_storage[address].add(key)
+
     trie = state._storage_tries.get(address)
     if trie is None:
         return U256(0)
-
     value = trie_get(trie, key)
-
     assert isinstance(value, U256)
     return value
 
@@ -329,6 +397,13 @@ def set_storage(
     trie_set(trie, key, value)
     if trie._data == {}:
         del state._storage_tries[address]
+
+    # Track dirty storage for deferred witness generation
+    if state._witness_state is not None:
+        ws = state._witness_state
+        if address not in ws.dirty_storage:
+            ws.dirty_storage[address] = set()
+        ws.dirty_storage[address].add(key)
 
 
 def storage_root(state: State, address: Address) -> Root:
@@ -375,7 +450,18 @@ def state_root(state: State) -> Root:
     def get_storage_root(address: Address) -> Root:
         return storage_root(state, address)
 
-    return root(state._main_trie, get_storage_root=get_storage_root)
+    # Calculate root using patricialize (existing implementation)
+    patricialize_root = root(state._main_trie, get_storage_root=get_storage_root)
+
+    # If witness mode is enabled, verify IncrementalMPT produces same root
+    if state._witness_state is not None:
+        incremental_root, _ = generate_witness(state)
+        assert patricialize_root == incremental_root, (
+            f"Root mismatch! patricialize={patricialize_root.hex()} "
+            f"incremental={incremental_root.hex()}"
+        )
+
+    return patricialize_root
 
 
 def account_exists(state: State, address: Address) -> bool:
@@ -665,3 +751,206 @@ def set_transient_storage(
     trie_set(trie, key, value)
     if trie._data == {}:
         del transient_storage._tries[address]
+
+
+# =============================================================================
+# Witness Generation Functions
+# =============================================================================
+
+
+def enable_witness_mode(state: State) -> None:
+    """
+    Enable witness tracking mode for the state.
+
+    Preserves the current (pre-block) state and sets up dirty tracking.
+    The actual witness generation is deferred until after block execution.
+
+    Parameters
+    ----------
+    state :
+        The state to enable witness mode on.
+
+    """
+    assert not state._snapshots, "Cannot enable witness mode during transaction"
+
+    state._witness_state = WitnessState(
+        pre_block_main_trie_data=dict(state._main_trie._data),
+        pre_block_storage_tries_data={
+            addr: dict(trie._data)
+            for addr, trie in state._storage_tries.items()
+        },
+    )
+
+
+def is_witness_mode_enabled(state: State) -> bool:
+    """
+    Check if witness tracking mode is enabled.
+
+    Parameters
+    ----------
+    state :
+        The state to check.
+
+    Returns
+    -------
+    enabled : `bool`
+        True if witness mode is enabled.
+
+    """
+    return state._witness_state is not None
+
+
+def generate_witness(state: State) -> Tuple[Root, Witness]:
+    """
+    Build MPT from pre-block state, generate execution witness, return root.
+
+    This is called after all block execution completes. It builds a fresh
+    IncrementalMPT from the pre-block state, traverses read paths to record
+    pre-state nodes, then applies the final diff for writes. This produces
+    an execution witness containing nodes needed for:
+    - Verifying pre-state values that were read
+    - Re-executing the block
+    - Computing the post-state root
+
+    Parameters
+    ----------
+    state :
+        The state with witness tracking enabled.
+
+    Returns
+    -------
+    root : `Root`
+        The state root computed via IncrementalMPT.
+    witness : `Witness`
+        The execution witness containing accessed nodes.
+
+    """
+    assert state._witness_state is not None
+    ws = state._witness_state
+
+    # Build fresh MPT from pre-block state
+    pre_main_trie: Trie[Address, Optional[Account]] = Trie(
+        secured=True, default=None
+    )
+    pre_main_trie._data = dict(ws.pre_block_main_trie_data)
+
+    # Build pre-block storage MPTs
+    storage_mpts: Dict[Address, IncrementalMPT[Bytes32, U256]] = {}
+    for address, data in ws.pre_block_storage_tries_data.items():
+        pre_storage_trie: Trie[Bytes32, U256] = Trie(
+            secured=True, default=U256(0)
+        )
+        pre_storage_trie._data = dict(data)
+        storage_mpts[address] = build_mpt(pre_storage_trie)
+
+    def get_pre_storage_root(address: Address) -> Root:
+        if address in ws.pre_block_storage_tries_data:
+            pre_trie: Trie[Bytes32, U256] = Trie(secured=True, default=U256(0))
+            pre_trie._data = dict(ws.pre_block_storage_tries_data[address])
+            return root(pre_trie)
+        return EMPTY_TRIE_ROOT
+
+    main_mpt = build_mpt(pre_main_trie, get_pre_storage_root)
+
+    # 1. Traverse read-only storage keys (accessed but not dirty)
+    #    This records pre-state paths for values that were read
+    for address, accessed_keys in ws.accessed_storage.items():
+        dirty_keys = ws.dirty_storage.get(address, set())
+        read_only_keys = accessed_keys - dirty_keys
+
+        if read_only_keys:
+            if address not in storage_mpts:
+                # Storage was accessed but didn't exist pre-block
+                empty_trie: Trie[Bytes32, U256] = Trie(
+                    secured=True, default=U256(0)
+                )
+                storage_mpts[address] = build_mpt(empty_trie)
+
+            for key in read_only_keys:
+                mpt_get(storage_mpts[address], key)
+
+    # 2. Apply dirty storage (writes)
+    for address, dirty_keys in ws.dirty_storage.items():
+        if address not in storage_mpts:
+            # New storage created during block
+            empty_trie: Trie[Bytes32, U256] = Trie(
+                secured=True, default=U256(0)
+            )
+            storage_mpts[address] = build_mpt(empty_trie)
+
+        storage_trie = state._storage_tries.get(address)
+        for key in dirty_keys:
+            value = trie_get(storage_trie, key) if storage_trie else U256(0)
+            mpt_set(storage_mpts[address], key, value)
+
+    # Accounts are "dirty" if:
+    # - Account fields changed (nonce/balance/code) - tracked in dirty_accounts
+    # - Storage changed (storage root changed) - tracked in dirty_storage
+    all_dirty_accounts = ws.dirty_accounts | set(ws.dirty_storage.keys())
+
+    # 3. Traverse read-only accounts (accessed but not dirty)
+    #    This records pre-state paths for accounts that were read
+    read_only_accounts = ws.accessed_accounts - all_dirty_accounts
+    for address in read_only_accounts:
+        mpt_get(main_mpt, address)
+
+    # 4. Apply dirty accounts (writes, with current storage roots)
+    for address in all_dirty_accounts:
+        account = trie_get(state._main_trie, address)
+
+        # Get storage root for this account
+        if address in storage_mpts:
+            addr_storage_root = mpt_root(storage_mpts[address])
+        elif address in state._storage_tries:
+            addr_storage_root = root(state._storage_tries[address])
+        else:
+            addr_storage_root = EMPTY_TRIE_ROOT
+
+        # Use a closure that captures the specific storage root for this address
+        def make_storage_root_getter(
+            sr: Root,
+        ) -> Callable[[Address], Root]:
+            return lambda _: sr
+
+        mpt_set(
+            main_mpt,
+            address,
+            account,
+            get_storage_root=make_storage_root_getter(addr_storage_root),
+        )
+
+    # Collect witness from all MPTs
+    witness = Witness(
+        accessed_nodes=dict(main_mpt.witness.accessed_nodes),
+        accessed_keys=set(main_mpt.witness.accessed_keys),
+    )
+    for mpt in storage_mpts.values():
+        witness.accessed_nodes.update(mpt.witness.accessed_nodes)
+        witness.accessed_keys.update(mpt.witness.accessed_keys)
+
+    return mpt_root(main_mpt), witness
+
+
+def get_witness(state: State) -> Witness:
+    """
+    Get the collected witness data from the state.
+
+    This generates the witness by building an MPT from the pre-block state
+    and applying only the final diff.
+
+    Parameters
+    ----------
+    state :
+        The state with witness tracking enabled.
+
+    Returns
+    -------
+    witness : `Witness`
+        The witness data containing accessed nodes.
+
+    """
+    if state._witness_state is None:
+        return Witness()
+
+    _, witness = generate_witness(state)
+    return witness

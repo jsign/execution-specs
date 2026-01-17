@@ -448,6 +448,12 @@ EngineNewPayloadParameters = Union[
 ]
 
 
+class ExecutionWitness(CamelModel):
+    """Execution witness containing RLP-encoded trie nodes accessed during block execution."""
+
+    nodes: List[str]
+
+
 class FixtureEngineNewPayload(CamelModel):
     """
     Representation of the `engine_newPayloadVX` information to be sent using
@@ -468,6 +474,7 @@ class FixtureEngineNewPayload(CamelModel):
         ]
         | None
     ) = None
+    execution_witness: ExecutionWitness | None = None
 
     def valid(self) -> bool:
         """Return whether the payload is valid."""
@@ -581,24 +588,6 @@ class FixtureWithdrawal(WithdrawalGeneric[ZeroPaddedHexNumber]):
         return cls(**w.model_dump())
 
 
-class WitnessChunk(CamelModel):
-    """Represents execution witness data for a block."""
-
-    state: List[str]
-    codes: List[str]
-    keys: List[str]
-    headers: List[str]
-
-    @classmethod
-    def parse_witness_chunks(cls, s: str) -> List[Self]:
-        """
-        Parse multiple witness chunks from JSON string.
-
-        Returns a list of WitnessChunk instances parsed from the JSON array.
-        """
-        return [cls(**obj) for obj in json.loads(s)]
-
-
 class FixtureBlockBase(CamelModel):
     """
     Representation of an Ethereum block within a test Fixture without RLP
@@ -625,7 +614,7 @@ class FixtureBlockBase(CamelModel):
         default_factory=list, alias="uncleHeaders"
     )
     withdrawals: List[FixtureWithdrawal] | None = None
-    execution_witness: WitnessChunk | None = None
+    execution_witness: ExecutionWitness | None = None
     fork: Fork | None = Field(None, exclude=True)
 
     @computed_field(alias="blocknumber")  # type: ignore[prop-decorator]

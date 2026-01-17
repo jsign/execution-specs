@@ -380,6 +380,7 @@ class BuiltBlock(CamelModel):
                 if self.withdrawals is not None
                 else None
             ),
+            execution_witness=self.result.execution_witness,
             fork=self.fork,
         ).with_rlp(txs=self.txs)
 
@@ -414,6 +415,7 @@ class BuiltBlock(CamelModel):
             else None,
             validation_error=self.expected_exception,
             error_code=self.engine_api_error_code,
+            execution_witness=self.result.execution_witness,
         )
 
     def verify_transactions(
