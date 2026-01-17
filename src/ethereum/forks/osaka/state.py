@@ -942,10 +942,9 @@ def _build_witness_mpts(state: State) -> None:
         if read_only_keys:
             if address not in storage_mpts:
                 # Storage was accessed but didn't exist pre-block
-                empty_trie: Trie[Bytes32, U256] = Trie(
-                    secured=True, default=U256(0)
+                storage_mpts[address] = build_mpt(
+                    Trie(secured=True, default=U256(0))
                 )
-                storage_mpts[address] = build_mpt(empty_trie)
 
             for key in read_only_keys:
                 mpt_get(storage_mpts[address], key)
@@ -954,10 +953,9 @@ def _build_witness_mpts(state: State) -> None:
     for address, dirty_keys in ws.dirty_storage.items():
         if address not in storage_mpts:
             # New storage created during block
-            empty_trie: Trie[Bytes32, U256] = Trie(
-                secured=True, default=U256(0)
+            storage_mpts[address] = build_mpt(
+                Trie(secured=True, default=U256(0))
             )
-            storage_mpts[address] = build_mpt(empty_trie)
 
         storage_trie = state._storage_tries.get(address)
         for key in dirty_keys:
@@ -987,11 +985,16 @@ def _build_witness_mpts(state: State) -> None:
         else:
             addr_storage_root = EMPTY_TRIE_ROOT
 
+        def get_storage_root_fn(
+            _: Address, sr: Root = addr_storage_root
+        ) -> Root:
+            return sr
+
         mpt_set(
             main_mpt,
             address,
             account,
-            get_storage_root=lambda _, sr=addr_storage_root: sr,
+            get_storage_root=get_storage_root_fn,
         )
 
     # Cache the built MPTs
@@ -1019,6 +1022,8 @@ def incremental_state_root(state: State) -> Root:
     """
     assert state._witness_state is not None
     _build_witness_mpts(state)
+    assert state._witness_state._main_mpt is not None
+    assert state._witness_state._storage_mpts is not None
     return mpt_root(state._witness_state._main_mpt)
 
 
@@ -1050,6 +1055,8 @@ def generate_witness(state: State) -> Tuple[Root, Witness]:
 
     # Ensure MPTs are built
     _build_witness_mpts(state)
+    assert ws._main_mpt is not None
+    assert ws._storage_mpts is not None
 
     main_mpt = ws._main_mpt
     storage_mpts = ws._storage_mpts
