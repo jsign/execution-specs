@@ -11,7 +11,6 @@ Introduction
 Entry point for the Ethereum specification.
 """
 
-import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -768,13 +767,6 @@ def apply_body(
         The block output for the current block.
 
     """
-    # Auto-enable witness mode if WITNESS_MODE env var is set
-    # This allows validating IncrementalMPT against patricialize
-    if os.environ.get("WITNESS_MODE") and not is_witness_mode_enabled(
-        block_env.state
-    ):
-        enable_witness_mode(block_env.state)
-
     block_output = vm.BlockOutput()
 
     process_unchecked_system_transaction(
