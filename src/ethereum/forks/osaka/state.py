@@ -23,6 +23,8 @@ from ethereum_types.bytes import Bytes, Bytes32
 from ethereum_types.frozen import modify
 from ethereum_types.numeric import U256, Uint
 
+from ethereum.crypto.hash import keccak256
+
 from .fork_types import EMPTY_ACCOUNT, Account, Address, Root
 from .trie import (
     EMPTY_TRIE_ROOT,
@@ -63,6 +65,9 @@ class WitnessState:
     # Access tracking during execution (reads)
     accessed_accounts: Set[Address] = field(default_factory=set)
     accessed_storage: Dict[Address, Set[Bytes32]] = field(default_factory=dict)
+
+    # Bytecode tracking (code_hash -> bytecode)
+    accessed_bytecodes: Dict[Bytes32, Bytes] = field(default_factory=dict)
 
 
 @dataclass
@@ -283,6 +288,33 @@ def destroy_account(state: State, address: Address) -> None:
     """
     destroy_storage(state, address)
     set_account(state, address, None)
+
+
+def track_bytecode_access(state: State, code: Bytes) -> None:
+    """
+    Track bytecode access for execution witness generation.
+
+    Should be called when bytecode is accessed for execution purposes
+    (CALL variants, EXTCODESIZE, EXTCODECOPY, system contracts).
+
+    Parameters
+    ----------
+    state : State
+        The state with optional witness tracking.
+    code : Bytes
+        The bytecode being accessed.
+    """
+    if state._witness_state is None:
+        return
+
+    # Skip empty bytecode (EOAs)
+    if len(code) == 0:
+        return
+
+    # Compute hash and store for deduplication
+    code_hash = Bytes32(keccak256(code))
+    if code_hash not in state._witness_state.accessed_bytecodes:
+        state._witness_state.accessed_bytecodes[code_hash] = code
 
 
 def destroy_storage(state: State, address: Address) -> None:
@@ -923,6 +955,7 @@ def generate_witness(state: State) -> Tuple[Root, Witness]:
     witness = Witness(
         accessed_nodes=dict(main_mpt.witness.accessed_nodes),
         accessed_keys=set(main_mpt.witness.accessed_keys),
+        bytecodes=sorted(ws.accessed_bytecodes.values()),
     )
     for mpt in storage_mpts.values():
         witness.accessed_nodes.update(mpt.witness.accessed_nodes)

@@ -62,6 +62,7 @@ from .state import (
     modify_state,
     set_account_balance,
     state_root,
+    track_bytecode_access,
 )
 from .transactions import (
     AccessListTransaction,
@@ -679,6 +680,7 @@ def process_checked_system_transaction(
 
     """
     system_contract_code = get_account(block_env.state, target_address).code
+    track_bytecode_access(block_env.state, system_contract_code)
 
     if len(system_contract_code) == 0:
         raise InvalidBlock(
@@ -727,6 +729,7 @@ def process_unchecked_system_transaction(
 
     """
     system_contract_code = get_account(block_env.state, target_address).code
+    track_bytecode_access(block_env.state, system_contract_code)
     return process_system_transaction(
         block_env,
         target_address,

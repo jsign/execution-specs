@@ -181,6 +181,7 @@ class Witness:
         default_factory=dict
     )  # hash -> RLP encoding
     accessed_keys: Set[Bytes] = field(default_factory=set)  # Original keys
+    bytecodes: List[Bytes] = field(default_factory=list)  # Accessed bytecodes
 
 
 @dataclass

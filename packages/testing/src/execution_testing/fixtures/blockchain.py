@@ -449,9 +449,10 @@ EngineNewPayloadParameters = Union[
 
 
 class ExecutionWitness(CamelModel):
-    """Execution witness containing RLP-encoded trie nodes accessed during block execution."""
+    """Execution witness containing RLP-encoded trie nodes and bytecodes accessed during block execution."""
 
     nodes: List[str]
+    bytecodes: List[str] = []
 
 
 class FixtureEngineNewPayload(CamelModel):
