@@ -69,6 +69,14 @@ class WitnessState:
     # Bytecode tracking (code_hash -> bytecode)
     accessed_bytecodes: Dict[Bytes32, Bytes] = field(default_factory=dict)
 
+    # Ancestor tracking - oldest block accessed via BLOCKHASH
+    # All headers from this block to parent are needed for chain validation
+    oldest_accessed_block: Optional[Uint] = None
+
+    # Block metadata for ancestor collection
+    current_block_number: Uint = field(default_factory=lambda: Uint(0))
+    block_headers: List[Bytes] = field(default_factory=list)
+
 
 @dataclass
 class State:
@@ -315,6 +323,51 @@ def track_bytecode_access(state: State, code: Bytes) -> None:
     code_hash = Bytes32(keccak256(code))
     if code_hash not in state._witness_state.accessed_bytecodes:
         state._witness_state.accessed_bytecodes[code_hash] = code
+
+
+def track_block_hash_access(state: State, block_number: Uint) -> None:
+    """
+    Track a block hash access for execution witness generation.
+
+    Called when BLOCKHASH opcode or system contracts access a block hash.
+    Tracks the oldest block accessed since all headers from that block
+    to the parent are needed for chain validation.
+
+    Parameters
+    ----------
+    state : State
+        The state with optional witness tracking.
+    block_number : Uint
+        The block number being accessed.
+    """
+    if state._witness_state is None:
+        return
+
+    ws = state._witness_state
+    if ws.oldest_accessed_block is None or block_number < ws.oldest_accessed_block:
+        ws.oldest_accessed_block = block_number
+
+
+def set_witness_metadata(
+    state: State, current_block_number: Uint, block_headers: List[Bytes]
+) -> None:
+    """
+    Set block metadata needed for ancestor collection in witness generation.
+
+    Parameters
+    ----------
+    state : State
+        The state with witness tracking enabled.
+    current_block_number : Uint
+        The current block number being executed.
+    block_headers : List[Bytes]
+        RLP-encoded headers of previous blocks (up to 256).
+    """
+    if state._witness_state is None:
+        return
+
+    state._witness_state.current_block_number = current_block_number
+    state._witness_state.block_headers = block_headers
 
 
 def destroy_storage(state: State, address: Address) -> None:
@@ -951,11 +1004,26 @@ def generate_witness(state: State) -> Tuple[Root, Witness]:
             get_storage_root=make_storage_root_getter(addr_storage_root),
         )
 
+    # Collect ancestors from oldest accessed block to parent (inclusive)
+    # All headers in this range needed for parent hash chain validation
+    ancestors: List[Bytes] = []
+    if ws.oldest_accessed_block is not None and ws.block_headers:
+        # Include all headers from oldest accessed to parent (block_number - 1)
+        for block_num in range(
+            int(ws.oldest_accessed_block), int(ws.current_block_number)
+        ):
+            offset = int(ws.current_block_number) - block_num
+            if offset <= len(ws.block_headers):
+                header_rlp = ws.block_headers[-offset]
+                if header_rlp:
+                    ancestors.append(header_rlp)
+
     # Collect witness from all MPTs
     witness = Witness(
         accessed_nodes=dict(main_mpt.witness.accessed_nodes),
         accessed_keys=set(main_mpt.witness.accessed_keys),
         bytecodes=sorted(ws.accessed_bytecodes.values()),
+        ancestors=ancestors,
     )
     for mpt in storage_mpts.values():
         witness.accessed_nodes.update(mpt.witness.accessed_nodes)

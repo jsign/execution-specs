@@ -453,6 +453,7 @@ class ExecutionWitness(CamelModel):
 
     nodes: List[str]
     bytecodes: List[str] = []
+    ancestors: List[str] = []
 
 
 class FixtureEngineNewPayload(CamelModel):

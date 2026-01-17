@@ -336,16 +336,19 @@ class Result:
         # Extract execution witness for Osaka+ forks
         if hasattr(t8n.fork, "get_witness"):
             witness = t8n.fork.get_witness(block_env.state)
-            if witness.accessed_nodes or witness.bytecodes:
-                self.execution_witness = {
-                    "nodes": [
-                        "0x" + node_rlp.hex()
-                        for node_rlp in witness.accessed_nodes.values()
-                    ],
-                    "bytecodes": [
-                        "0x" + bytecode.hex() for bytecode in witness.bytecodes
-                    ],
-                }
+            self.execution_witness = {
+                "nodes": [
+                    "0x" + node_rlp.hex()
+                    for node_rlp in witness.accessed_nodes.values()
+                ],
+                "bytecodes": [
+                    "0x" + bytecode.hex() for bytecode in witness.bytecodes
+                ],
+                "ancestors": [
+                    "0x" + header_rlp.hex()
+                    for header_rlp in witness.ancestors
+                ],
+            }
 
 
     @staticmethod

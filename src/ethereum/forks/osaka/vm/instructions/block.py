@@ -16,6 +16,7 @@ from ethereum_types.numeric import U256, Uint
 from .. import Evm
 from ..gas import GAS_BASE, GAS_BLOCK_HASH, charge_gas
 from ..stack import pop, push
+from ...state import track_block_hash_access
 
 
 def block_hash(evm: Evm) -> None:
@@ -57,6 +58,8 @@ def block_hash(evm: Evm) -> None:
         current_block_hash = evm.message.block_env.block_hashes[
             -(current_block_number - block_number)
         ]
+        # Track access for witness generation
+        track_block_hash_access(evm.message.block_env.state, block_number)
 
     push(evm.stack, U256.from_be_bytes(current_block_hash))
 

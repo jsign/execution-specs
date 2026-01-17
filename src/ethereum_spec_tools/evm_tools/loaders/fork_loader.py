@@ -314,6 +314,16 @@ class ForkLoad:
         return self._module("state").get_witness
 
     @property
+    def set_witness_metadata(self) -> Any:
+        """set_witness_metadata function of the fork (Osaka+ only)."""
+        return self._module("state").set_witness_metadata
+
+    @property
+    def track_block_hash_access(self) -> Any:
+        """track_block_hash_access function of the fork (Osaka+ only)."""
+        return self._module("state").track_block_hash_access
+
+    @property
     def create_ether(self) -> Any:
         """create_ether function of the fork."""
         return self._module("state").create_ether

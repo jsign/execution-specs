@@ -96,6 +96,7 @@ def environment_from_parent_header(parent: "FixtureHeader") -> "Environment":
         parent_gas_limit=parent.gas_limit,
         parent_ommers_hash=parent.ommers_hash,
         block_hashes={parent.number: parent.block_hash},
+        block_headers={parent.number: parent.rlp},
     )
 
 
@@ -115,6 +116,9 @@ def apply_new_parent(
     block_hashes = env.block_hashes.copy()
     block_hashes[new_parent.number] = new_parent.block_hash
     updated["block_hashes"] = block_hashes
+    block_headers = env.block_headers.copy()
+    block_headers[new_parent.number] = new_parent.rlp
+    updated["block_headers"] = block_headers
     return env.copy(**updated)
 
 

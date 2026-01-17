@@ -47,6 +47,7 @@ class Env:
     parent_gas_limit: Optional[Uint]
     parent_base_fee_per_gas: Optional[Uint]
     block_hashes: Optional[List[Any]]
+    block_headers: List[bytes]
     parent_ommers_hash: Optional[Hash32]
     ommers: Any
     parent_beacon_block_root: Optional[Hash32]
@@ -277,19 +278,31 @@ class Env:
 
     def read_block_hashes(self, data: Any) -> None:
         """
-        Read the block hashes. Returns a maximum of 256 block hashes.
+        Read block hashes and headers. Supports both blockHashes and
+        blockHeaders inputs. If blockHeaders is provided, hashes are
+        computed from the RLP-encoded headers.
         """
-        # Read the block hashes
         block_hashes: List[Any] = []
+        block_headers: List[bytes] = []
 
-        # The hex key strings provided might not have standard formatting
+        # Check if blockHeaders is provided (preferred)
+        clean_block_headers: Dict[int, bytes] = {}
         clean_block_hashes: Dict[int, Hash32] = {}
-        if "blockHashes" in data:
+
+        if "blockHeaders" in data:
+            # Read headers and compute hashes from them
+            for key, value in data["blockHeaders"].items():
+                int_key = int(key, 16)
+                header_rlp = hex_to_bytes(value)
+                clean_block_headers[int_key] = header_rlp
+                clean_block_hashes[int_key] = Hash32(keccak256(header_rlp))
+        elif "blockHashes" in data:
+            # Fall back to blockHashes if no headers provided
             for key, value in data["blockHashes"].items():
                 int_key = int(key, 16)
                 clean_block_hashes[int_key] = Hash32(hex_to_bytes(value))
 
-        # Store a maximum of 256 block hashes.
+        # Store a maximum of 256 block hashes/headers
         max_blockhash_count = min(Uint(256), self.block_number)
         for number in range(
             self.block_number - max_blockhash_count, self.block_number
@@ -299,7 +312,13 @@ class Env:
             else:
                 block_hashes.append(None)
 
+            if number in clean_block_headers.keys():
+                block_headers.append(clean_block_headers[number])
+            else:
+                block_headers.append(b"")
+
         self.block_hashes = block_hashes
+        self.block_headers = block_headers
 
     def read_ommers(self, data: Any, t8n: "T8N") -> None:
         """

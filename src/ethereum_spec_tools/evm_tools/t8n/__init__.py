@@ -361,6 +361,12 @@ class T8N(Load):
         # Enable witness mode for Osaka+ forks
         if hasattr(self.fork, "enable_witness_mode"):
             self.fork.enable_witness_mode(block_env.state)
+            if hasattr(self.fork, "set_witness_metadata"):
+                self.fork.set_witness_metadata(
+                    block_env.state,
+                    self.env.block_number,
+                    self.env.block_headers,
+                )
 
         self.backup_state()
         if len(self.txs.transactions) > 0:
@@ -382,6 +388,11 @@ class T8N(Load):
 
     def _run_blockchain_test(self, block_env: Any, block_output: Any) -> None:
         if self.fork.has_compute_requests_hash:
+            # Track parent block access for witness (EIP-2935 system call)
+            if hasattr(self.fork, "track_block_hash_access"):
+                self.fork.track_block_hash_access(
+                    block_env.state, block_env.number - Uint(1)
+                )
             self.fork.process_unchecked_system_transaction(
                 block_env=block_env,
                 target_address=self.fork.HISTORY_STORAGE_ADDRESS,
@@ -456,6 +467,12 @@ class T8N(Load):
         # Enable witness mode for Osaka+ forks
         if hasattr(self.fork, "enable_witness_mode"):
             self.fork.enable_witness_mode(block_env.state)
+            if hasattr(self.fork, "set_witness_metadata"):
+                self.fork.set_witness_metadata(
+                    block_env.state,
+                    self.env.block_number,
+                    self.env.block_headers,
+                )
 
         try:
             self._run_blockchain_test(block_env, block_output)

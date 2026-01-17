@@ -182,6 +182,7 @@ class Witness:
     )  # hash -> RLP encoding
     accessed_keys: Set[Bytes] = field(default_factory=set)  # Original keys
     bytecodes: List[Bytes] = field(default_factory=list)  # Accessed bytecodes
+    ancestors: List[Bytes] = field(default_factory=list)  # RLP-encoded headers
 
 
 @dataclass
