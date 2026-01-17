@@ -629,9 +629,7 @@ def _build_mutable_tree(
         return MutableExtensionNode(key_segment=prefix, child=child)
 
     # Branch node case
-    branches: List[MutableMapping[Bytes, Bytes]] = []
-    for _ in range(16):
-        branches.append({})
+    branches: List[MutableMapping[Bytes, Bytes]] = [{} for _ in range(16)]
     value = b""
 
     for key in obj:
@@ -726,8 +724,7 @@ def _encode_mutable_node(node: MutableNode) -> Extended:
         )
     elif isinstance(node, MutableBranchNode):
         children_encoded = [
-            _encode_mutable_node_to_extended(child)
-            for child in node.children
+            _encode_mutable_node_to_extended(child) for child in node.children
         ]
         return children_encoded + [node.value]
     else:
@@ -943,7 +940,7 @@ def _mpt_insert_node(
 
 
 def _insert_into_leaf(
-    mpt: IncrementalMPT,
+    _mpt: IncrementalMPT,
     node: MutableLeafNode,
     key: Bytes,
     value: Bytes,
@@ -1024,9 +1021,7 @@ def _insert_into_extension(
     # Extension needs to be split
     if prefix_len > 0:
         # Partial match - create new extension for common prefix
-        new_child = _split_extension(
-            node, remaining_key, value, prefix_len
-        )
+        new_child = _split_extension(node, remaining_key, value, prefix_len)
         return MutableExtensionNode(
             key_segment=segment[:prefix_len], child=new_child
         )
@@ -1191,7 +1186,9 @@ def _delete_from_branch(
     return _collapse_branch(mpt, node)
 
 
-def _collapse_branch(mpt: IncrementalMPT, node: MutableBranchNode) -> MutableNode:
+def _collapse_branch(
+    mpt: IncrementalMPT, node: MutableBranchNode
+) -> MutableNode:
     """Collapse a branch node if it has only one child and no value."""
     non_empty = [(i, c) for i, c in enumerate(node.children) if c is not None]
 

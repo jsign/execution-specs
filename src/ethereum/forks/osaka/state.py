@@ -77,6 +77,10 @@ class WitnessState:
     current_block_number: Uint = field(default_factory=lambda: Uint(0))
     block_headers: List[Bytes] = field(default_factory=list)
 
+    # Pre-execution MPTs
+    _main_mpt: Optional["IncrementalMPT"] = None
+    _storage_mpts: Optional[Dict[Address, "IncrementalMPT"]] = None
+
 
 @dataclass
 class State:
@@ -311,12 +315,10 @@ def track_bytecode_access(state: State, code: Bytes) -> None:
         The state with optional witness tracking.
     code : Bytes
         The bytecode being accessed.
-    """
-    if state._witness_state is None:
-        return
 
-    # Skip empty bytecode (EOAs)
-    if len(code) == 0:
+    """
+    # Skip if witness mode disabled or empty bytecode (EOAs)
+    if state._witness_state is None or len(code) == 0:
         return
 
     # Compute hash and store for deduplication
@@ -339,12 +341,17 @@ def track_block_hash_access(state: State, block_number: Uint) -> None:
         The state with optional witness tracking.
     block_number : Uint
         The block number being accessed.
+
     """
     if state._witness_state is None:
         return
 
     ws = state._witness_state
-    if ws.oldest_accessed_block is None or block_number < ws.oldest_accessed_block:
+    is_oldest = (
+        ws.oldest_accessed_block is None
+        or block_number < ws.oldest_accessed_block
+    )
+    if is_oldest:
         ws.oldest_accessed_block = block_number
 
 
@@ -362,6 +369,7 @@ def set_witness_metadata(
         The current block number being executed.
     block_headers : List[Bytes]
         RLP-encoded headers of previous blocks (up to 256).
+
     """
     if state._witness_state is None:
         return
@@ -386,10 +394,8 @@ def destroy_storage(state: State, address: Address) -> None:
     if state._witness_state is not None:
         ws = state._witness_state
         if address in ws.pre_block_storage_tries_data:
-            if address not in ws.dirty_storage:
-                ws.dirty_storage[address] = set()
             # Mark all pre-block storage keys as dirty (they're now deleted)
-            ws.dirty_storage[address].update(
+            ws.dirty_storage.setdefault(address, set()).update(
                 ws.pre_block_storage_tries_data[address].keys()
             )
 
@@ -442,9 +448,7 @@ def get_storage(state: State, address: Address, key: Bytes32) -> U256:
     # Track accessed storage for execution witness generation
     if state._witness_state is not None:
         ws = state._witness_state
-        if address not in ws.accessed_storage:
-            ws.accessed_storage[address] = set()
-        ws.accessed_storage[address].add(key)
+        ws.accessed_storage.setdefault(address, set()).add(key)
 
     trie = state._storage_tries.get(address)
     if trie is None:
@@ -485,10 +489,7 @@ def set_storage(
 
     # Track dirty storage for deferred witness generation
     if state._witness_state is not None:
-        ws = state._witness_state
-        if address not in ws.dirty_storage:
-            ws.dirty_storage[address] = set()
-        ws.dirty_storage[address].add(key)
+        state._witness_state.dirty_storage.setdefault(address, set()).add(key)
 
 
 def storage_root(state: State, address: Address) -> Root:
@@ -536,14 +537,16 @@ def state_root(state: State) -> Root:
         return storage_root(state, address)
 
     # Calculate root using patricialize (existing implementation)
-    patricialize_root = root(state._main_trie, get_storage_root=get_storage_root)
+    patricialize_root = root(
+        state._main_trie, get_storage_root=get_storage_root
+    )
 
     # If witness mode is enabled, verify IncrementalMPT produces same root
     if state._witness_state is not None:
-        incremental_root, _ = generate_witness(state)
-        assert patricialize_root == incremental_root, (
+        inc_root = incremental_state_root(state)
+        assert patricialize_root == inc_root, (
             f"Root mismatch! patricialize={patricialize_root.hex()} "
-            f"incremental={incremental_root.hex()}"
+            f"incremental={inc_root.hex()}"
         )
 
     return patricialize_root
@@ -856,7 +859,7 @@ def enable_witness_mode(state: State) -> None:
         The state to enable witness mode on.
 
     """
-    assert not state._snapshots, "Cannot enable witness mode during transaction"
+    assert not state._snapshots, "Cannot enable witness during transaction"
 
     state._witness_state = WitnessState(
         pre_block_main_trie_data=dict(state._main_trie._data),
@@ -885,33 +888,26 @@ def is_witness_mode_enabled(state: State) -> bool:
     return state._witness_state is not None
 
 
-def generate_witness(state: State) -> Tuple[Root, Witness]:
+def _build_witness_mpts(state: State) -> None:
     """
-    Build MPT from pre-block state, generate execution witness, return root.
+    Build and cache the IncrementalMPTs for witness generation.
 
-    This is called after all block execution completes. It builds a fresh
-    IncrementalMPT from the pre-block state, traverses read paths to record
-    pre-state nodes, then applies the final diff for writes. This produces
-    an execution witness containing nodes needed for:
-    - Verifying pre-state values that were read
-    - Re-executing the block
-    - Computing the post-state root
+    This builds the MPTs from pre-block state, applies all reads and writes,
+    which records witness nodes as a side effect. The MPTs are cached in
+    WitnessState for reuse by root computation and witness extraction.
 
     Parameters
     ----------
     state :
         The state with witness tracking enabled.
 
-    Returns
-    -------
-    root : `Root`
-        The state root computed via IncrementalMPT.
-    witness : `Witness`
-        The execution witness containing accessed nodes.
-
     """
     assert state._witness_state is not None
     ws = state._witness_state
+
+    # Already built
+    if ws._main_mpt is not None:
+        return
 
     # Build fresh MPT from pre-block state
     pre_main_trie: Trie[Address, Optional[Account]] = Trie(
@@ -991,18 +987,72 @@ def generate_witness(state: State) -> Tuple[Root, Witness]:
         else:
             addr_storage_root = EMPTY_TRIE_ROOT
 
-        # Use a closure that captures the specific storage root for this address
-        def make_storage_root_getter(
-            sr: Root,
-        ) -> Callable[[Address], Root]:
-            return lambda _: sr
-
         mpt_set(
             main_mpt,
             address,
             account,
-            get_storage_root=make_storage_root_getter(addr_storage_root),
+            get_storage_root=lambda _, sr=addr_storage_root: sr,
         )
+
+    # Cache the built MPTs
+    ws._main_mpt = main_mpt
+    ws._storage_mpts = storage_mpts
+
+
+def incremental_state_root(state: State) -> Root:
+    """
+    Compute state root using IncrementalMPT.
+
+    Builds the MPTs if not already built, then returns the root.
+    The MPT nodes cache their hashes, so subsequent calls are fast.
+
+    Parameters
+    ----------
+    state :
+        The state with witness tracking enabled.
+
+    Returns
+    -------
+    root : `Root`
+        The state root computed via IncrementalMPT.
+
+    """
+    assert state._witness_state is not None
+    _build_witness_mpts(state)
+    return mpt_root(state._witness_state._main_mpt)
+
+
+def generate_witness(state: State) -> Tuple[Root, Witness]:
+    """
+    Generate execution witness from the cached MPTs.
+
+    Builds the MPTs if not already built, then extracts the witness
+    data from them. The witness contains nodes needed for:
+    - Verifying pre-state values that were read
+    - Re-executing the block
+    - Computing the post-state root
+
+    Parameters
+    ----------
+    state :
+        The state with witness tracking enabled.
+
+    Returns
+    -------
+    root : `Root`
+        The state root computed via IncrementalMPT.
+    witness : `Witness`
+        The execution witness containing accessed nodes.
+
+    """
+    assert state._witness_state is not None
+    ws = state._witness_state
+
+    # Ensure MPTs are built
+    _build_witness_mpts(state)
+
+    main_mpt = ws._main_mpt
+    storage_mpts = ws._storage_mpts
 
     # Collect ancestors from oldest accessed block to parent (inclusive)
     # All headers in this range needed for parent hash chain validation
@@ -1035,9 +1085,6 @@ def generate_witness(state: State) -> Tuple[Root, Witness]:
 def get_witness(state: State) -> Witness:
     """
     Get the collected witness data from the state.
-
-    This generates the witness by building an MPT from the pre-block state
-    and applying only the final diff.
 
     Parameters
     ----------

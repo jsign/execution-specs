@@ -345,8 +345,7 @@ class Result:
                     "0x" + bytecode.hex() for bytecode in witness.bytecodes
                 ],
                 "ancestors": [
-                    "0x" + header_rlp.hex()
-                    for header_rlp in witness.ancestors
+                    "0x" + header_rlp.hex() for header_rlp in witness.ancestors
                 ],
             }
 

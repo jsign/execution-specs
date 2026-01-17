@@ -1293,6 +1293,7 @@ webSocket
 wei
 wfile
 whitelist
+ws
 wikipedia
 wordlist
 Words2
