@@ -55,8 +55,8 @@ class WitnessState:
     """
 
     # Pre-block state (preserved at enable_witness_mode time)
-    pre_block_main_trie_data: Dict[Address, Optional[Account]]
-    pre_block_storage_tries_data: Dict[Address, Dict[Bytes32, U256]]
+    pre_state_accounts: Dict[Address, Optional[Account]]
+    pre_state_storages: Dict[Address, Dict[Bytes32, U256]]
 
     # Dirty tracking during execution (writes)
     dirty_accounts: Set[Address] = field(default_factory=set)
@@ -393,10 +393,10 @@ def destroy_storage(state: State, address: Address) -> None:
     # Track all pre-block storage keys as dirty for witness generation
     if state._witness_state is not None:
         ws = state._witness_state
-        if address in ws.pre_block_storage_tries_data:
+        if address in ws.pre_state_storages:
             # Mark all pre-block storage keys as dirty (they're now deleted)
             ws.dirty_storage.setdefault(address, set()).update(
-                ws.pre_block_storage_tries_data[address].keys()
+                ws.pre_state_storages[address].keys()
             )
 
     if address in state._storage_tries:
@@ -862,8 +862,8 @@ def enable_witness_mode(state: State) -> None:
     assert not state._snapshots, "Cannot enable witness during transaction"
 
     state._witness_state = WitnessState(
-        pre_block_main_trie_data=dict(state._main_trie._data),
-        pre_block_storage_tries_data={
+        pre_state_accounts=dict(state._main_trie._data),
+        pre_state_storages={
             addr: dict(trie._data)
             for addr, trie in state._storage_tries.items()
         },
@@ -913,11 +913,11 @@ def _build_witness_mpts(state: State) -> None:
     pre_main_trie: Trie[Address, Optional[Account]] = Trie(
         secured=True, default=None
     )
-    pre_main_trie._data = dict(ws.pre_block_main_trie_data)
+    pre_main_trie._data = dict(ws.pre_state_accounts)
 
     # Build pre-block storage MPTs
     storage_mpts: Dict[Address, IncrementalMPT[Bytes32, U256]] = {}
-    for address, data in ws.pre_block_storage_tries_data.items():
+    for address, data in ws.pre_state_storages.items():
         pre_storage_trie: Trie[Bytes32, U256] = Trie(
             secured=True, default=U256(0)
         )
@@ -925,10 +925,8 @@ def _build_witness_mpts(state: State) -> None:
         storage_mpts[address] = build_mpt(pre_storage_trie)
 
     def get_pre_storage_root(address: Address) -> Root:
-        if address in ws.pre_block_storage_tries_data:
-            pre_trie: Trie[Bytes32, U256] = Trie(secured=True, default=U256(0))
-            pre_trie._data = dict(ws.pre_block_storage_tries_data[address])
-            return root(pre_trie)
+        if address in storage_mpts:
+            return mpt_root(storage_mpts[address])
         return EMPTY_TRIE_ROOT
 
     main_mpt = build_mpt(pre_main_trie, get_pre_storage_root)
@@ -939,15 +937,12 @@ def _build_witness_mpts(state: State) -> None:
         dirty_keys = ws.dirty_storage.get(address, set())
         read_only_keys = accessed_keys - dirty_keys
 
-        if read_only_keys:
-            if address not in storage_mpts:
-                # Storage was accessed but didn't exist pre-block
-                storage_mpts[address] = build_mpt(
-                    Trie(secured=True, default=U256(0))
-                )
+        # Skip if no pre-block storage - empty storage proof is in account's storage_root
+        if not read_only_keys or address not in storage_mpts:
+            continue
 
-            for key in read_only_keys:
-                mpt_get(storage_mpts[address], key)
+        for key in read_only_keys:
+            mpt_get(storage_mpts[address], key)
 
     # 2. Apply dirty storage (writes)
     for address, dirty_keys in ws.dirty_storage.items():
@@ -958,9 +953,16 @@ def _build_witness_mpts(state: State) -> None:
             )
 
         storage_trie = state._storage_tries.get(address)
+        # First pass: inserts and updates
         for key in dirty_keys:
             value = trie_get(storage_trie, key) if storage_trie else U256(0)
-            mpt_set(storage_mpts[address], key, value)
+            if value != 0:
+                mpt_set(storage_mpts[address], key, value)
+        # Second pass: deletions
+        for key in dirty_keys:
+            value = trie_get(storage_trie, key) if storage_trie else U256(0)
+            if value == 0:
+                mpt_set(storage_mpts[address], key, value)
 
     # Accounts are "dirty" if:
     # - Account fields changed (nonce/balance/code) - tracked in dirty_accounts
@@ -980,10 +982,17 @@ def _build_witness_mpts(state: State) -> None:
         # Get storage root for this account
         if address in storage_mpts:
             addr_storage_root = mpt_root(storage_mpts[address])
-        elif address in state._storage_tries:
-            addr_storage_root = root(state._storage_tries[address])
+            # Verify invariant: MPT root must match state storage root
+            # (if storage was fully cleared, it won't be in state._storage_tries)
+            if address in state._storage_tries:
+                assert addr_storage_root == root(state._storage_tries[address])
+            else:
+                assert addr_storage_root == EMPTY_TRIE_ROOT
         else:
+            # Verify invariant: no storage in state either
+            assert address not in state._storage_tries
             addr_storage_root = EMPTY_TRIE_ROOT
+            
 
         def get_storage_root_fn(
             _: Address, sr: Root = addr_storage_root
