@@ -337,10 +337,12 @@ class Result:
         if hasattr(t8n.fork, "get_witness"):
             witness = t8n.fork.get_witness(block_env.state)
             self.execution_witness = {
-                "nodes": [
-                    "0x" + node_rlp.hex()
-                    for node_rlp in witness.accessed_nodes.values()
-                ],
+                "nodes": sorted(
+                    [
+                        "0x" + node_rlp.hex()
+                        for node_rlp in witness.accessed_nodes.values()
+                    ]
+                ),
                 "bytecodes": [
                     "0x" + bytecode.hex() for bytecode in witness.bytecodes
                 ],
@@ -348,7 +350,6 @@ class Result:
                     "0x" + header_rlp.hex() for header_rlp in witness.ancestors
                 ],
             }
-
 
     @staticmethod
     def _block_access_list_to_json(account_changes: Any) -> Any:
@@ -415,7 +416,7 @@ class Result:
             json_account_changes.append(account_data)
 
         return json_account_changes
-        
+
     def json_encode_receipts(self) -> Any:
         """
         Encode receipts to JSON.

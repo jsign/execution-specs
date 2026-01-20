@@ -54,11 +54,8 @@ from .state import (
     State,
     TransientStorage,
     destroy_account,
-    enable_witness_mode,
     get_account,
-    get_witness,
     increment_nonce,
-    is_witness_mode_enabled,
     modify_state,
     set_account_balance,
     set_witness_metadata,
@@ -213,6 +210,7 @@ def get_last_256_block_headers(chain: BlockChain) -> List[Bytes]:
     -------
     recent_block_headers : `List[Bytes]`
         RLP-encoded headers of recent 256 blocks in order of increasing number.
+
     """
     recent_blocks = chain.blocks[-256:]
     if len(recent_blocks) == 0:

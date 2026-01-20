@@ -420,6 +420,53 @@ def bytes_to_nibble_list(bytes_: Bytes) -> Bytes:
     return Bytes(nibble_list)
 
 
+def _prepare_data(
+    data: Mapping[K, V],
+    secured: bool,
+    get_storage_root: Optional[Callable[[Address], Root]] = None,
+) -> Mapping[Bytes, Bytes]:
+    """
+    Prepares data for trie root calculation. Removes values that are empty,
+    hashes the keys (if `secured == True`) and encodes all the nodes.
+
+    Parameters
+    ----------
+    data :
+        The key-value data to prepare.
+    secured :
+        Whether keys should be hashed.
+    get_storage_root :
+        Function to get the storage root of an account. Needed to encode
+        `Account` objects.
+
+    Returns
+    -------
+    out : `Mapping[ethereum.base_types.Bytes, Node]`
+        Object with keys mapped to nibble-byte form.
+
+    """
+    mapped: MutableMapping[Bytes, Bytes] = {}
+
+    for preimage, value in data.items():
+        if isinstance(value, Account):
+            assert get_storage_root is not None
+            address = Address(preimage)
+            encoded_value = encode_node(value, get_storage_root(address))
+        else:
+            encoded_value = encode_node(value)
+        if encoded_value == b"":
+            raise AssertionError
+        key: Bytes
+        if secured:
+            # "secure" tries hash keys once before construction
+            key = keccak256(preimage)
+        else:
+            key = preimage
+        mapped[bytes_to_nibble_list(key)] = encoded_value
+
+    return mapped
+
+
 def _prepare_trie(
     trie: Trie[K, V],
     get_storage_root: Optional[Callable[[Address], Root]] = None,
@@ -442,26 +489,7 @@ def _prepare_trie(
         Object with keys mapped to nibble-byte form.
 
     """
-    mapped: MutableMapping[Bytes, Bytes] = {}
-
-    for preimage, value in trie._data.items():
-        if isinstance(value, Account):
-            assert get_storage_root is not None
-            address = Address(preimage)
-            encoded_value = encode_node(value, get_storage_root(address))
-        else:
-            encoded_value = encode_node(value)
-        if encoded_value == b"":
-            raise AssertionError
-        key: Bytes
-        if trie.secured:
-            # "secure" tries hash keys once before construction
-            key = keccak256(preimage)
-        else:
-            key = preimage
-        mapped[bytes_to_nibble_list(key)] = encoded_value
-
-    return mapped
+    return _prepare_data(trie._data, trie.secured, get_storage_root)
 
 
 def root(
@@ -574,11 +602,6 @@ def patricialize(
     )
 
 
-# =============================================================================
-# Incremental MPT Functions
-# =============================================================================
-
-
 def _build_mutable_tree(
     obj: Mapping[Bytes, Bytes], level: Uint
 ) -> MutableNode:
@@ -646,19 +669,25 @@ def _build_mutable_tree(
 
 
 def build_mpt(
-    trie: Trie[K, V],
+    data: Mapping[K, V],
+    secured: bool,
+    default: V,
     get_storage_root: Optional[Callable[[Address], Root]] = None,
 ) -> IncrementalMPT[K, V]:
     """
-    Build an IncrementalMPT from an existing Trie.
+    Build an IncrementalMPT from key-value data.
 
     This is called with the pre-execution state to create a mutable
     tree structure that can be updated in-place during execution.
 
     Parameters
     ----------
-    trie :
-        The source Trie to build from.
+    data :
+        The source key-value data to build from.
+    secured :
+        Whether to hash keys before insertion.
+    default :
+        Default value for missing keys.
     get_storage_root :
         Function to get the storage root of an account.
 
@@ -668,14 +697,14 @@ def build_mpt(
         An incremental MPT with the same data.
 
     """
-    prepared = _prepare_trie(trie, get_storage_root)
+    prepared = _prepare_data(data, secured, get_storage_root)
     root_node = _build_mutable_tree(prepared, Uint(0))
 
     return IncrementalMPT(
-        secured=trie.secured,
-        default=trie.default,
+        secured=secured,
+        default=default,
         root_node=root_node,
-        _data=copy.copy(trie._data),
+        _data=dict(data),
     )
 
 

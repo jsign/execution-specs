@@ -13,10 +13,10 @@ Implementations of the EVM block instructions.
 
 from ethereum_types.numeric import U256, Uint
 
+from ...state import track_block_hash_access
 from .. import Evm
 from ..gas import GAS_BASE, GAS_BLOCK_HASH, charge_gas
 from ..stack import pop, push
-from ...state import track_block_hash_access
 
 
 def block_hash(evm: Evm) -> None:
