@@ -43,6 +43,7 @@ from ..state import (
     move_ether,
     rollback_transaction,
     set_code,
+    track_bytecode_access,
 )
 from ..vm import Message
 from ..vm.eoa_delegation import get_delegated_code_address, set_delegation
@@ -131,6 +132,7 @@ def process_message_call(message: Message) -> MessageCallOutput:
             message.disable_precompiles = True
             message.accessed_addresses.add(delegated_address)
             message.code = get_account(block_env.state, delegated_address).code
+            track_bytecode_access(block_env.state, message.code)
             message.code_address = delegated_address
 
         evm = process_message(message)

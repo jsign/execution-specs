@@ -270,6 +270,7 @@ class Result:
     block_exception: Optional[str] = None
     block_access_list: Optional[Any] = None
     block_access_list_hash: Optional[Hash32] = None
+    execution_witness: Optional[Dict[str, List[str]]] = None
 
     def get_receipts_from_output(
         self,
@@ -332,6 +333,23 @@ class Result:
                     block_output.block_access_list
                 )
             )
+        # Extract execution witness for Osaka+ forks
+        if hasattr(t8n.fork, "get_witness"):
+            witness = t8n.fork.get_witness(block_env.state)
+            self.execution_witness = {
+                "nodes": sorted(
+                    [
+                        "0x" + node_rlp.hex()
+                        for node_rlp in witness.accessed_nodes.values()
+                    ]
+                ),
+                "bytecodes": [
+                    "0x" + bytecode.hex() for bytecode in witness.bytecodes
+                ],
+                "ancestors": [
+                    "0x" + header_rlp.hex() for header_rlp in witness.ancestors
+                ],
+            }
 
     @staticmethod
     def _block_access_list_to_json(account_changes: Any) -> Any:
@@ -476,5 +494,7 @@ class Result:
             data["blockAccessListHash"] = encode_to_hex(
                 self.block_access_list_hash
             )
+        if self.execution_witness is not None:
+            data["executionWitness"] = self.execution_witness
 
         return data

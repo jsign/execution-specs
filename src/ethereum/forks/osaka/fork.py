@@ -58,7 +58,10 @@ from .state import (
     increment_nonce,
     modify_state,
     set_account_balance,
+    set_witness_metadata,
     state_root,
+    track_block_hash_access,
+    track_bytecode_access,
 )
 from .transactions import (
     AccessListTransaction,
@@ -191,6 +194,36 @@ def get_last_256_block_hashes(chain: BlockChain) -> List[Hash32]:
     return recent_block_hashes
 
 
+def get_last_256_block_headers(chain: BlockChain) -> List[Bytes]:
+    """
+    Obtain the list of RLP-encoded headers of the previous 256 blocks.
+
+    This function will return less headers for the first 256 blocks.
+    The headers are parallel to the hashes from get_last_256_block_hashes.
+
+    Parameters
+    ----------
+    chain :
+        History and current state.
+
+    Returns
+    -------
+    recent_block_headers : `List[Bytes]`
+        RLP-encoded headers of recent 256 blocks in order of increasing number.
+
+    """
+    recent_blocks = chain.blocks[-256:]
+    if len(recent_blocks) == 0:
+        return []
+
+    recent_block_headers: List[Bytes] = []
+    for block in recent_blocks:
+        header_rlp = rlp.encode(block.header)
+        recent_block_headers.append(header_rlp)
+
+    return recent_block_headers
+
+
 def state_transition(chain: BlockChain, block: Block) -> None:
     """
     Attempts to apply a block to an existing block chain.
@@ -233,6 +266,13 @@ def state_transition(chain: BlockChain, block: Block) -> None:
         prev_randao=block.header.prev_randao,
         excess_blob_gas=block.header.excess_blob_gas,
         parent_beacon_block_root=block.header.parent_beacon_block_root,
+    )
+
+    # Set witness metadata if tracking is enabled
+    set_witness_metadata(
+        block_env.state,
+        block.header.number,
+        get_last_256_block_headers(chain),
     )
 
     block_output = apply_body(
@@ -676,6 +716,7 @@ def process_checked_system_transaction(
 
     """
     system_contract_code = get_account(block_env.state, target_address).code
+    track_bytecode_access(block_env.state, system_contract_code)
 
     if len(system_contract_code) == 0:
         raise InvalidBlock(
@@ -724,6 +765,7 @@ def process_unchecked_system_transaction(
 
     """
     system_contract_code = get_account(block_env.state, target_address).code
+    track_bytecode_access(block_env.state, system_contract_code)
     return process_system_transaction(
         block_env,
         target_address,
@@ -769,6 +811,9 @@ def apply_body(
         target_address=BEACON_ROOTS_ADDRESS,
         data=block_env.parent_beacon_block_root,
     )
+
+    # Track parent block access for witness (EIP-2935 system call)
+    track_block_hash_access(block_env.state, block_env.number - Uint(1))
 
     process_unchecked_system_transaction(
         block_env=block_env,

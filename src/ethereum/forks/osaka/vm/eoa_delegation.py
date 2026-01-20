@@ -13,7 +13,13 @@ from ethereum.crypto.hash import keccak256
 from ethereum.exceptions import InvalidBlock, InvalidSignatureError
 
 from ..fork_types import Address, Authorization
-from ..state import account_exists, get_account, increment_nonce, set_code
+from ..state import (
+    account_exists,
+    get_account,
+    increment_nonce,
+    set_code,
+    track_bytecode_access,
+)
 from ..utils.hexadecimal import hex_to_address
 from ..vm.gas import GAS_COLD_ACCOUNT_ACCESS, GAS_WARM_ACCESS
 from . import Evm, Message
@@ -136,6 +142,7 @@ def access_delegation(
     state = evm.message.block_env.state
 
     code = get_account(state, address).code
+    track_bytecode_access(state, code)
     if not is_valid_delegation(code):
         return False, address, code, Uint(0)
 
@@ -146,6 +153,7 @@ def access_delegation(
         evm.accessed_addresses.add(address)
         access_gas_cost = GAS_COLD_ACCOUNT_ACCESS
     code = get_account(state, address).code
+    track_bytecode_access(state, code)
 
     return True, address, code, access_gas_cost
 

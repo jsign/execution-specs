@@ -350,6 +350,17 @@ class T8N(Load):
                 block_env.state, ommer.coinbase, ommer_miner_reward
             )
 
+    def _enable_witness_mode(self, block_env: Any) -> None:
+        """Enable witness tracking mode if supported by the fork (Osaka+)."""
+        if hasattr(self.fork, "enable_witness_mode"):
+            self.fork.enable_witness_mode(block_env.state)
+            if hasattr(self.fork, "set_witness_metadata"):
+                self.fork.set_witness_metadata(
+                    block_env.state,
+                    self.env.block_number,
+                    self.env.block_headers,
+                )
+
     def run_state_test(self) -> Any:
         """
         Apply a single transaction on pre-state. No system operations
@@ -357,6 +368,9 @@ class T8N(Load):
         """
         block_env = self.block_environment()
         block_output = self.fork.BlockOutput()
+
+        self._enable_witness_mode(block_env)
+
         self.backup_state()
         if len(self.txs.transactions) > 0:
             tx = self.txs.transactions[0]
@@ -377,6 +391,11 @@ class T8N(Load):
 
     def _run_blockchain_test(self, block_env: Any, block_output: Any) -> None:
         if self.fork.has_compute_requests_hash:
+            # Track parent block access for witness (EIP-2935 system call)
+            if hasattr(self.fork, "track_block_hash_access"):
+                self.fork.track_block_hash_access(
+                    block_env.state, block_env.number - Uint(1)
+                )
             self.fork.process_unchecked_system_transaction(
                 block_env=block_env,
                 target_address=self.fork.HISTORY_STORAGE_ADDRESS,
@@ -447,6 +466,8 @@ class T8N(Load):
         """
         block_env = self.block_environment()
         block_output = self.fork.BlockOutput()
+
+        self._enable_witness_mode(block_env)
 
         try:
             self._run_blockchain_test(block_env, block_output)
