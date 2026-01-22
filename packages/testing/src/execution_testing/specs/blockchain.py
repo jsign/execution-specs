@@ -83,6 +83,11 @@ from .base import BaseTest, OpMode, verify_result
 from .debugging import print_traces
 from .helpers import verify_block, verify_transactions
 
+# Imports for ExecutionWitness validation (Osaka+)
+from ethereum.forks.osaka.blocks import ExecutionWitness as SpecsExecutionWitness
+from ethereum.forks.osaka.stateless import validate_execution_witness
+from execution_testing.fixtures.blockchain import ExecutionWitness
+
 
 def environment_from_parent_header(parent: "FixtureHeader") -> "Environment":
     """Instantiate new environment with the provided header as parent."""
@@ -131,6 +136,41 @@ def count_blobs(txs: List[Transaction]) -> int:
             if tx.blob_versioned_hashes is not None
         ]
     )
+
+
+def _convert_execution_witness_for_validation(
+    witness: ExecutionWitness,
+) -> SpecsExecutionWitness:
+    """Convert testing ExecutionWitness (hex strings) to specs format (bytes) for validation."""
+    return SpecsExecutionWitness(
+        nodes=[bytes.fromhex(n[2:]) for n in witness.nodes],
+        bytecodes=[bytes.fromhex(b[2:]) for b in witness.bytecodes],
+        ancestors=[bytes.fromhex(a[2:]) for a in witness.ancestors],
+    )
+
+
+def _validate_execution_witness(
+    built_block: "BuiltBlock",
+    parent_hash: Hash,
+) -> None:
+    """
+    Validate execution witness for stateless execution coherence.
+
+    Only validates if the block has an execution witness (Osaka+ forks).
+    Raises an exception if validation fails.
+    """
+    witness = built_block.result.execution_witness
+    if witness is None:
+        return  # Not an Osaka+ fork or witness not generated
+
+    specs_witness = _convert_execution_witness_for_validation(witness)
+    parent_hash_bytes = bytes.fromhex(str(parent_hash)[2:])
+
+    if not validate_execution_witness(specs_witness, parent_hash_bytes):
+        raise Exception(
+            f"ExecutionWitness validation failed for block {built_block.header.number}. "
+            f"Parent hash: {parent_hash}"
+        )
 
 
 class Header(CamelModel):
@@ -854,6 +894,8 @@ class BlockchainTest(BaseTest):
                 last_block=i == len(self.blocks) - 1,
             )
             fixture_blocks.append(built_block.get_fixture_block())
+            # Validate execution witness for stateless coherence (Osaka+)
+            _validate_execution_witness(built_block, parent_hash=head)
 
             # BAL verification already done in to_fixture_bal() if
             # expected_block_access_list set
@@ -936,6 +978,8 @@ class BlockchainTest(BaseTest):
             fixture_payloads.append(
                 built_block.get_fixture_engine_new_payload()
             )
+            # Validate execution witness for stateless coherence (Osaka+)
+            _validate_execution_witness(built_block, parent_hash=head_hash)
             if block.exception is None:
                 alloc = built_block.alloc
                 state_root = built_block.state_root
