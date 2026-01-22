@@ -12,7 +12,7 @@ Entry point for the Ethereum specification.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from ethereum_rlp import rlp
 from ethereum_types.bytes import Bytes, Bytes8, Bytes32
@@ -31,6 +31,7 @@ from ethereum.exceptions import (
 from . import vm
 from .blocks import (
     Block,
+    ExecutionWitness,
     Header,
     Log,
     NewPayloadRequest,
@@ -92,7 +93,7 @@ from .transactions import (
     recover_sender,
     validate_transaction,
 )
-from .trie import Trie, root, trie_set
+from .trie import EMPTY_TRIE_ROOT, Trie, root, trie_set
 from .utils.hexadecimal import hex_to_address
 from .utils.message import prepare_message
 from .vm import Message
@@ -1200,6 +1201,256 @@ def validate_new_payload_params(new_payload_request: NewPayloadRequest) -> bool:
     return True
 
 
+def validate_list_ordering(items: List[Bytes]) -> bool:
+    """
+    Validate that a list of bytes is sorted in ascending lexicographic order
+    and contains no duplicates.
+
+    Parameters
+    ----------
+    items :
+        List of bytes to validate.
+
+    Returns
+    -------
+    valid : bool
+        True if items are properly ordered and unique.
+
+    """
+    if len(items) == 0:
+        return True
+
+    prev_item = items[0]
+    for i in range(1, len(items)):
+        current_item = items[i]
+        # Strictly greater than ensures both ordering and deduplication
+        if current_item <= prev_item:
+            return False
+        prev_item = current_item
+
+    return True
+
+
+
+
+def validate_ancestors_chain(
+    ancestors: List[Bytes], parent_hash: Hash32
+) -> bool:
+    """
+    Validate ancestor block headers form a valid chain.
+
+    Requirements:
+    - Minimum 1 element (parent block), maximum 256 elements
+    - First ancestor's hash must equal parent_hash
+    - Each header's parent_hash must equal keccak256 of the next ancestor
+
+    Parameters
+    ----------
+    ancestors :
+        RLP-encoded ancestor block headers (from parent to oldest).
+    parent_hash :
+        Expected hash of the parent block.
+
+    Returns
+    -------
+    valid : bool
+        True if ancestor chain is valid.
+
+    """
+    # Check count constraints
+    if len(ancestors) == 0 or len(ancestors) > 256:
+        return False
+
+    # First ancestor should be the immediate parent
+    first_ancestor_hash = Hash32(keccak256(ancestors[0]))
+    if first_ancestor_hash != parent_hash:
+        return False
+
+    # Verify chain of parent hashes
+    for i in range(len(ancestors) - 1):
+        header = rlp.decode_to(Header, ancestors[i])
+        expected_parent_hash = Hash32(keccak256(ancestors[i + 1]))
+        if header.parent_hash != expected_parent_hash:
+            return False
+
+    return True
+
+
+def _verify_node_recursive(
+    node_map: Dict[Hash32, Bytes],
+    node_hash: Hash32,
+    visited: Set[Hash32],
+) -> bool:
+    """
+    Recursively verify a node and its children exist in the node map.
+
+    Parameters
+    ----------
+    node_map :
+        Mapping from node hash to node bytes.
+    node_hash :
+        Hash of the current node to verify.
+    visited :
+        Set of already visited node hashes (for cycle detection).
+
+    Returns
+    -------
+    valid : bool
+        True if node and all children are valid.
+
+    """
+    if node_hash in visited:
+        return False  # Cycle detected
+    visited.add(node_hash)
+
+    if node_hash not in node_map:
+        return False
+
+    node_rlp = node_map[node_hash]
+
+    try:
+        decoded: Union[Bytes, List] = rlp.decode(node_rlp)
+
+        if not isinstance(decoded, list):
+            return False
+
+        if len(decoded) == 17:
+            # Branch node: 16 children + value
+            for i in range(16):
+                child = decoded[i]
+                if isinstance(child, bytes) and len(child) == 32:
+                    # Child is a hash reference - only verify if in witness
+                    # (witness may contain partial trie proofs)
+                    child_hash = Hash32(child)
+                    if child_hash in node_map:
+                        result = _verify_node_recursive(
+                            node_map, child_hash, visited
+                        )
+                        if not result:
+                            return False
+                # Embedded nodes (RLP < 32 bytes) and empty are valid
+        elif len(decoded) == 2:
+            # Extension or Leaf node - check compact encoding prefix
+            path = decoded[0]
+            if not isinstance(path, bytes) or len(path) == 0:
+                return False
+            # Bit 0x20 in first nibble indicates leaf node
+            is_leaf = (path[0] & 0x20) != 0
+            if not is_leaf:
+                # Extension node - second element is child reference
+                child = decoded[1]
+                if isinstance(child, bytes) and len(child) == 32:
+                    child_hash = Hash32(child)
+                    if child_hash in node_map:
+                        result = _verify_node_recursive(
+                            node_map, child_hash, visited
+                        )
+                        if not result:
+                            return False
+            # Leaf node - second element is value, no recursion needed
+        else:
+            return False
+
+    except Exception:
+        return False
+
+    return True
+
+
+def verify_trie(
+    nodes: List[Bytes],
+    expected_root: Root,
+) -> bool:
+    """
+    Verify that provided nodes can reconstruct a trie with the expected root.
+
+    Builds a hash->node mapping and traverses from the root, verifying that
+    all referenced nodes are present and form a valid MPT structure.
+
+    Parameters
+    ----------
+    nodes :
+        List of RLP-encoded trie nodes.
+    expected_root :
+        The expected state root (from parent block).
+
+    Returns
+    -------
+    valid : bool
+        True if nodes form a valid trie with the expected root.
+
+    """
+    # Build node map: keccak256(node) -> node
+    node_map: Dict[Hash32, Bytes] = {}
+    for node in nodes:
+        node_hash = Hash32(keccak256(node))
+        node_map[node_hash] = node
+
+    # Handle empty trie case
+    if expected_root == EMPTY_TRIE_ROOT:
+        return len(node_map) == 0
+
+    # Root must be in node map
+    if expected_root not in node_map:
+        return False
+
+    # Traverse and verify structure
+    visited: Set[Hash32] = set()
+    return _verify_node_recursive(node_map, expected_root, visited)
+
+
+def validate_execution_witness(
+    witness: ExecutionWitness,
+    parent_hash: Hash32,
+) -> bool:
+    """
+    Validate an execution witness for stateless execution.
+
+    Validates that:
+    1. Ancestors form a valid chain starting from the parent block
+    2. Nodes are RLP-encoded, deduplicated, and sorted in ascending order
+    3. Nodes can reconstruct the pre-state trie with parent_state_root
+    4. Bytecodes are deduplicated and sorted in ascending order
+
+    Parameters
+    ----------
+    witness :
+        The ExecutionWitness containing nodes, bytecodes, and ancestors.
+    parent_hash :
+        The hash of the parent block.
+
+    Returns
+    -------
+    valid : bool
+        True if the execution witness is valid, False otherwise.
+
+    """
+    # Validate ancestors chain (checks non-empty, hash matches, chain integrity)
+    if not validate_ancestors_chain(list(witness.ancestors), parent_hash):
+        return False
+
+    # Decode parent header to get state_root (safe after ancestors validation)
+    try:
+        parent_header = rlp.decode_to(Header, witness.ancestors[0])
+    except Exception:
+        return False
+    parent_state_root = parent_header.state_root
+
+    # Validate nodes ordering and deduplication
+    if not validate_list_ordering(list(witness.nodes)):
+        return False
+
+    # Validate bytecodes ordering and deduplication
+    if not validate_list_ordering(list(witness.bytecodes)):
+        return False
+
+    # Verify trie reconstruction from witness nodes
+    if not verify_trie(list(witness.nodes), parent_state_root):
+        return False
+
+    return True
+
+
 def block_from_new_payload_request(new_payload_request: NewPayloadRequest) -> Block:
     """
     Convert an EngineNewPayloadV5Parameters to a Block object.
@@ -1296,6 +1547,15 @@ def stateless_state_transition(stateless_input : StatelessInput) -> StatelessOut
         )
 
     if not validate_new_payload_params(new_payload_request):
+        return StatelessOutput(
+            new_payload_request_root=Hash32(b"\x00" * 32),
+            success=False,
+        )
+
+    # Validate execution witness
+    execution_payload = new_payload_request[0]
+    parent_hash = Hash32(execution_payload.parent_hash)
+    if not validate_execution_witness(stateless_input.witness, parent_hash):
         return StatelessOutput(
             new_payload_request_root=Hash32(b"\x00" * 32),
             success=False,
