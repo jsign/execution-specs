@@ -13,17 +13,14 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 from ethereum_rlp import rlp
-from ethereum_types.bytes import Bytes, Bytes8, Bytes32, FixedBytes
+from ethereum_types.bytes import Bytes, Bytes8, Bytes32
 from ethereum_types.frozen import slotted_freezable
 from ethereum_types.numeric import U64, U256, Uint
-from execution_testing.fixtures.blockchain import (
-    EngineNewPayloadParameters,
-    ExecutionWitness,
-)
+from execution_testing.fixtures.blockchain import EngineNewPayloadParameters
 
 from ethereum.crypto.hash import Hash32
 
-from .fork_types import Address, Bloom, Root
+from .fork_types import Address, Bloom, Root, UncompressedPublicKey
 from .transactions import (
     AccessListTransaction,
     BlobTransaction,
@@ -408,24 +405,42 @@ def decode_receipt(receipt: Bytes | Receipt) -> Receipt:
     else:
         return receipt
 
+
+
 @slotted_freezable
 @dataclass
 class ExecutionWitness:
+    """
+    Execution witness for stateless block validation.
+
+    Contains all data needed to validate a block without full state access.
+    """
+
     nodes: List[Bytes]
+    """RLP-encoded trie nodes for pre-state reconstruction."""
+
     bytecodes: List[Bytes]
+    """Contract bytecodes accessed during execution."""
+
     ancestors: List[Bytes]
+    """RLP-encoded ancestor block headers."""
 
-class UncompressedPublicKey(FixedBytes[65]):
-    pass
 
-# TODO: reconsider if EngineNewPayloadParameters is appropriate here.
-# For now used for maximizing existing code reuse -- but might require
-# adjustments later.
 NewPayloadRequest = EngineNewPayloadParameters
+
 
 @slotted_freezable
 @dataclass
 class StatelessInput:
-    new_payload_request : NewPayloadRequest
-    witness : ExecutionWitness
-    public_keys : List[UncompressedPublicKey]
+    """
+    Input for stateless state transition execution.
+    """
+
+    new_payload_request: NewPayloadRequest
+    """The Engine API new payload request."""
+
+    witness: ExecutionWitness
+    """The execution witness containing pre-state data."""
+
+    public_keys: List[UncompressedPublicKey]
+    """Public keys for signature verification."""
