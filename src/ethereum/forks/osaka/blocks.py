@@ -10,12 +10,16 @@ chain.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Tuple
 
 from ethereum_rlp import rlp
-from ethereum_types.bytes import Bytes, Bytes8, Bytes32
+from ethereum_types.bytes import Bytes, Bytes8, Bytes32, FixedBytes
 from ethereum_types.frozen import slotted_freezable
 from ethereum_types.numeric import U64, U256, Uint
+from execution_testing.fixtures.blockchain import (
+    EngineNewPayloadParameters,
+    ExecutionWitness,
+)
 
 from ethereum.crypto.hash import Hash32
 
@@ -403,3 +407,25 @@ def decode_receipt(receipt: Bytes | Receipt) -> Receipt:
         return rlp.decode_to(Receipt, receipt[1:])
     else:
         return receipt
+
+@slotted_freezable
+@dataclass
+class ExecutionWitness:
+    nodes: List[Bytes]
+    bytecodes: List[Bytes]
+    ancestors: List[Bytes]
+
+class UncompressedPublicKey(FixedBytes[65]):
+    pass
+
+# TODO: reconsider if EngineNewPayloadParameters is appropriate here.
+# For now used for maximizing existing code reuse -- but might require
+# adjustments later.
+NewPayloadRequest = EngineNewPayloadParameters
+
+@slotted_freezable
+@dataclass
+class StatelessInput:
+    new_payload_request : NewPayloadRequest
+    witness : ExecutionWitness
+    public_keys : List[UncompressedPublicKey]
