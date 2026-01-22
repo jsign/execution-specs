@@ -36,7 +36,8 @@ from ethereum_types.frozen import slotted_freezable
 from ethereum_types.numeric import U256, Uint
 from typing_extensions import assert_type
 
-from ethereum.crypto.hash import keccak256
+from ethereum.crypto.hash import Hash32, keccak256
+from ethereum.exceptions import InvalidBlock
 from ethereum.forks.prague import trie as previous_trie
 from ethereum.utils.hexadecimal import hex_to_bytes
 
@@ -168,8 +169,22 @@ class MutableBranchNode:
     _rlp: Optional[Bytes] = None
 
 
+@dataclass
+class StubNode:
+    """
+    A stub representing a node hash not expanded in the witness.
+
+    Used in witness-backed tries when a hash reference exists but the
+    node data wasn't included in the witness. This allows us to:
+    1. Detect incomplete witnesses during traversal (raise InvalidBlock)
+    2. Still compute correct root hashes (the stub knows its hash)
+    """
+
+    node_hash: Hash32
+
+
 MutableNode = Union[
-    MutableLeafNode, MutableExtensionNode, MutableBranchNode, None
+    MutableLeafNode, MutableExtensionNode, MutableBranchNode, StubNode, None
 ]
 
 
@@ -199,6 +214,31 @@ class IncrementalMPT(Generic[K, V]):
     root_node: MutableNode = None
     witness: Witness = field(default_factory=Witness)
     _data: Dict[K, V] = field(default_factory=dict)  # For backward compat
+
+
+@dataclass
+class WitnessBackedTrie:
+    """
+    A trie backed by witness nodes for stateless execution.
+
+    Unlike IncrementalMPT which is built from key-value data, this trie is
+    built directly from RLP-encoded witness nodes.
+
+    This is a bytes->bytes trie. Keys are hashed with keccak256 before lookup
+    (always secured). Values are stored as raw encoded bytes - the caller is
+    responsible for encoding/decoding.
+
+    Attributes
+    ----------
+    root_node :
+        The mutable tree structure built from witness nodes.
+    witness :
+        Always None for witness-backed tries (we consume witnesses, not generate).
+        Present for compatibility with _mpt_insert_node/_mpt_delete_node.
+    """
+
+    root_node: MutableNode = None
+    witness: Optional[Witness] = None
 
 
 def encode_internal_node(node: Optional[InternalNode]) -> Extended:
@@ -396,6 +436,50 @@ def nibble_list_to_compact(x: Bytes, is_leaf: bool) -> Bytes:
             compact.append(16 * x[i] + x[i + 1])
 
     return Bytes(compact)
+
+
+def compact_to_nibble_list(compact: Bytes) -> Tuple[Bytes, bool]:
+    """
+    Decompresses a compact-encoded byte array back to a nibble-list with flag.
+
+    This is the inverse of `nibble_list_to_compact()`.
+
+    Parameters
+    ----------
+    compact :
+        The compact-encoded byte array.
+
+    Returns
+    -------
+    nibbles : `Bytes`
+        The decompressed nibble list.
+    is_leaf : `bool`
+        True if this is part of a leaf node, False if extension node.
+
+    """
+    if len(compact) == 0:
+        return Bytes(b""), False
+
+    first_byte = compact[0]
+    first_nibble = first_byte >> 4
+
+    # Bit 1 of first nibble is is_leaf flag
+    is_leaf = (first_nibble & 0x02) != 0
+    # Bit 0 of first nibble is parity (1 = odd length)
+    is_odd = (first_nibble & 0x01) != 0
+
+    nibbles = bytearray()
+
+    if is_odd:
+        # Odd length: second nibble of first byte is first nibble of path
+        nibbles.append(first_byte & 0x0F)
+
+    # Remaining bytes each contain two nibbles
+    for byte in compact[1:]:
+        nibbles.append(byte >> 4)
+        nibbles.append(byte & 0x0F)
+
+    return Bytes(nibbles), is_leaf
 
 
 def bytes_to_nibble_list(bytes_: Bytes) -> Bytes:
@@ -710,16 +794,22 @@ def build_mpt(
 
 def _invalidate_hash(node: MutableNode) -> None:
     """Invalidate the cached hash of a node."""
-    if node is not None:
-        node._hash = None
-        node._rlp = None
+    if node is None:
+        return
+    if isinstance(node, StubNode):
+        # Should never happen - traversal should have raised InvalidBlock earlier
+        raise InvalidBlock(
+            f"Attempted to invalidate hash of StubNode {node.node_hash.hex()}"
+        )
+    node._hash = None
+    node._rlp = None
 
 
 def _record_witness(
-    witness: Witness, node: MutableNode, key: Optional[Bytes] = None
+    witness: Optional[Witness], node: MutableNode, key: Optional[Bytes] = None
 ) -> None:
     """Record a node access in the witness."""
-    if node is None:
+    if witness is None or node is None:
         return
 
     # Record the key if provided
@@ -765,9 +855,14 @@ def _encode_mutable_node_to_extended(node: MutableNode) -> Extended:
     Encode a mutable node for embedding in parent.
 
     Returns the hash if RLP >= 32 bytes, otherwise returns unencoded form.
+    For StubNode, returns its known hash directly.
     """
     if node is None:
         return b""
+
+    if isinstance(node, StubNode):
+        # StubNode already knows its hash - return it directly
+        return Bytes(node.node_hash)
 
     unencoded = _encode_mutable_node(node)
     encoded = rlp.encode(unencoded)
@@ -788,6 +883,12 @@ def _compute_node_hash_and_rlp(
     """
     if node is None:
         return None, b""
+
+    if isinstance(node, StubNode):
+        # Should not be called on StubNode - we don't have the RLP data
+        raise InvalidBlock(
+            f"Cannot compute RLP for StubNode {node.node_hash.hex()}"
+        )
 
     # Use cached values if available
     if node._rlp is not None:
@@ -958,7 +1059,12 @@ def _mpt_insert_node(
 
     _invalidate_hash(node)
 
-    if isinstance(node, MutableLeafNode):
+    if isinstance(node, StubNode):
+        # Can't insert through a stub - witness is incomplete
+        raise InvalidBlock(
+            f"Cannot insert through stub node: {node.node_hash.hex()}"
+        )
+    elif isinstance(node, MutableLeafNode):
         return _insert_into_leaf(mpt, node, key, value, level)
     elif isinstance(node, MutableExtensionNode):
         return _insert_into_extension(mpt, node, key, value, level)
@@ -1141,7 +1247,12 @@ def _mpt_delete_node(
 
     _invalidate_hash(node)
 
-    if isinstance(node, MutableLeafNode):
+    if isinstance(node, StubNode):
+        # Can't delete through a stub - witness is incomplete
+        raise InvalidBlock(
+            f"Cannot delete through stub node: {node.node_hash.hex()}"
+        )
+    elif isinstance(node, MutableLeafNode):
         if node.rest_of_key == key[level:]:
             return None  # Key found, delete
         return node  # Key not found, no change
@@ -1229,7 +1340,13 @@ def _collapse_branch(
         _record_witness(mpt.witness, child)  # Record the surviving child
         nibble = Bytes([idx])
 
-        if isinstance(child, MutableLeafNode):
+        if isinstance(child, StubNode):
+            # Can't collapse with a stub - we don't know if it's a leaf,
+            # extension, or branch, so we can't merge correctly.
+            raise InvalidBlock(
+                f"Cannot collapse branch: sibling is stub {child.node_hash.hex()}"
+            )
+        elif isinstance(child, MutableLeafNode):
             return MutableLeafNode(
                 rest_of_key=nibble + child.rest_of_key,
                 value=child.value,
@@ -1239,9 +1356,11 @@ def _collapse_branch(
                 key_segment=nibble + child.key_segment,
                 child=child.child,
             )
-        else:
+        elif isinstance(child, MutableBranchNode):
             # Child is a branch - create extension
             return MutableExtensionNode(key_segment=nibble, child=child)
+        else:
+            raise AssertionError(f"Invalid node type {type(child)}")
 
     if len(non_empty) == 0 and node.value != b"":
         # Only value at this branch - convert to leaf
@@ -1271,6 +1390,301 @@ def mpt_root(mpt: IncrementalMPT) -> Root:
         return EMPTY_TRIE_ROOT
 
     root_encoded = _encode_mutable_node_to_extended(mpt.root_node)
+
+    if isinstance(root_encoded, Bytes):
+        return Root(root_encoded)
+    else:
+        return keccak256(rlp.encode(root_encoded))
+
+
+def _build_mutable_from_witness(
+    node_map: Dict[Hash32, Bytes],
+    node_ref: Bytes,
+    path_so_far: Bytes,
+) -> MutableNode:
+    """
+    Recursively build a MutableNode tree from witness nodes.
+
+    Parameters
+    ----------
+    node_map :
+        Mapping from node hash to RLP-encoded node bytes.
+    node_ref :
+        Reference to the current node (32-byte hash or embedded RLP < 32 bytes).
+    path_so_far :
+        Accumulated nibble path from the root to this node.
+
+    Returns
+    -------
+    node : MutableNode
+        The mutable tree node, or StubNode if hash not in witness.
+
+    """
+    if len(node_ref) == 0:
+        raise InvalidBlock("Empty node reference")
+    elif len(node_ref) < 32:
+        # Embedded node (RLP < 32 bytes)
+        decoded = rlp.decode(node_ref)
+    elif len(node_ref) == 32:
+        # 32-byte hash reference
+        node_hash = Hash32(node_ref)
+        if node_hash not in node_map:
+            # Hash not in witness - create a stub that preserves the hash
+            # This allows root computation but will raise InvalidBlock on access
+            return StubNode(node_hash=node_hash)
+        node_rlp = node_map[node_hash]
+        decoded = rlp.decode(node_rlp)
+    else:
+        raise InvalidBlock(
+            f"Invalid node reference length: {len(node_ref)} bytes"
+        )
+
+    if len(decoded) == 17:
+        # Branch node: 16 children + value
+        children: List[Optional[MutableNode]] = []
+        for i in range(16):
+            child_ref = decoded[i]
+            if child_ref == b"":
+                children.append(None)
+            else:
+                child_path = path_so_far + Bytes([i])
+                child_node = _build_mutable_from_witness(
+                    node_map, child_ref, child_path
+                )
+                children.append(child_node)
+
+        value = decoded[16] if decoded[16] != b"" else b""
+        return MutableBranchNode(children=children, value=value)
+
+    elif len(decoded) == 2:
+        # Extension or Leaf node
+        path_compact = decoded[0]
+        if not isinstance(path_compact, bytes):
+            return None
+
+        nibbles, is_leaf = compact_to_nibble_list(path_compact)
+
+        if is_leaf:
+            # Leaf node
+            value = decoded[1] if isinstance(decoded[1], bytes) else b""
+            return MutableLeafNode(rest_of_key=nibbles, value=value)
+        else:
+            # Extension node - recurse on child
+            child_ref = decoded[1]
+            child_node = _build_mutable_from_witness(
+                node_map, child_ref, path_so_far + nibbles
+            )
+            return MutableExtensionNode(key_segment=nibbles, child=child_node)
+
+    return None
+
+
+def build_witness_trie(
+    node_map: Dict[Hash32, Bytes],
+    root_hash: Hash32,
+) -> WitnessBackedTrie:
+    """
+    Build a WitnessBackedTrie from a node map and root hash.
+
+    Parameters
+    ----------
+    node_map :
+        Mapping from node hash to RLP-encoded node bytes (from witness).
+    root_hash :
+        The expected root hash (from parent block state root).
+
+    Returns
+    -------
+    trie : WitnessBackedTrie
+        The constructed trie with mutable tree structure.
+
+    """
+    if root_hash == EMPTY_TRIE_ROOT:
+        root_node = None
+    else:
+        root_node = _build_mutable_from_witness(
+            node_map, bytes(root_hash), Bytes(b"")
+        )
+
+    return WitnessBackedTrie(root_node=root_node)
+
+
+def _witness_trie_traverse(
+    node: MutableNode,
+    nibble_key: Bytes,
+    level: Uint,
+) -> Optional[Bytes]:
+    """
+    Traverse a witness-backed trie to find a value.
+
+    Parameters
+    ----------
+    node :
+        The current node in the traversal.
+    nibble_key :
+        The full nibble-encoded key to look up.
+    level :
+        Current position in the key.
+
+    Returns
+    -------
+    value : Optional[Bytes]
+        The encoded value if found, None if the key doesn't exist in trie.
+
+    Raises
+    ------
+    InvalidBlock :
+        If traversal hits a StubNode (witness incomplete for this path).
+
+    """
+    if node is None:
+        # Empty child in trie - key doesn't exist
+        return None
+
+    if isinstance(node, StubNode):
+        # Hit a stub - witness is incomplete for this path
+        raise InvalidBlock(
+            f"Witness incomplete: missing node {node.node_hash.hex()}"
+        )
+
+    lvl = int(level)
+
+    if isinstance(node, MutableLeafNode):
+        # Check if the remaining key matches
+        remaining_key = nibble_key[lvl:]
+        if remaining_key == node.rest_of_key:
+            return node.value
+        else:
+            # Key mismatch - key doesn't exist in trie
+            return None
+
+    elif isinstance(node, MutableExtensionNode):
+        # Check if the key segment matches
+        segment_len = len(node.key_segment)
+        if nibble_key[lvl : lvl + segment_len] == node.key_segment:
+            return _witness_trie_traverse(
+                node.child, nibble_key, Uint(lvl + segment_len)
+            )
+        else:
+            # Key segment mismatch - key doesn't exist in trie
+            return None
+
+    elif isinstance(node, MutableBranchNode):
+        if lvl == len(nibble_key):
+            # Key terminates at this branch
+            if node.value != b"":
+                return node.value
+            else:
+                # No value at this branch - key doesn't exist
+                return None
+        else:
+            # Follow the appropriate child
+            child_idx = nibble_key[lvl]
+            return _witness_trie_traverse(
+                node.children[child_idx], nibble_key, Uint(lvl + 1)
+            )
+
+    raise InvalidBlock(f"Unknown node type: {type(node)}")
+
+
+def witness_trie_get(trie: WitnessBackedTrie, key: Bytes) -> Optional[Bytes]:
+    """
+    Get a value from a witness-backed trie.
+
+    Returns None if the key doesn't exist in the trie (which is proven by the
+    witness structure - e.g., path mismatch or empty child).
+    Raises InvalidBlock only if the witness is incomplete (hits a StubNode).
+
+    Parameters
+    ----------
+    trie :
+        The witness-backed trie.
+    key :
+        The key to look up (will be hashed with keccak256).
+
+    Returns
+    -------
+    value : Optional[Bytes]
+        The encoded value at the key, or None if key doesn't exist.
+
+    Raises
+    ------
+    InvalidBlock :
+        If the witness is incomplete for this key path (hits a StubNode).
+
+    """
+    # Convert key to nibble path (always secured for account/storage tries)
+    nibble_key = bytes_to_nibble_list(keccak256(key))
+
+    # Handle empty trie
+    if trie.root_node is None:
+        return None
+
+    # Traverse the tree
+    return _witness_trie_traverse(trie.root_node, nibble_key, Uint(0))
+
+
+def witness_trie_set(
+    trie: WitnessBackedTrie,
+    key: Bytes,
+    value: Bytes,
+) -> None:
+    """
+    Set a value in a witness-backed trie.
+
+    Updates the tree in-place for computing post-state root.
+
+    Parameters
+    ----------
+    trie :
+        The witness-backed trie.
+    key :
+        The key to set (will be hashed with keccak256).
+    value :
+        The encoded value to set. Empty bytes means delete.
+
+    """
+    # Prepare key (always secured for account/storage tries)
+    nibble_key = bytes_to_nibble_list(keccak256(key))
+
+    # Update tree using the existing insert/delete functions
+    # Use cast since WitnessBackedTrie has the same interface as IncrementalMPT
+    # for the fields used by these functions (witness, root_node)
+    mpt_like = cast(IncrementalMPT, trie)
+
+    if value == b"":
+        # Delete operation
+        trie.root_node = _mpt_delete_node(
+            mpt_like, trie.root_node, nibble_key, Uint(0)
+        )
+    else:
+        # Insert/update operation
+        trie.root_node = _mpt_insert_node(
+            mpt_like, trie.root_node, nibble_key, value, Uint(0)
+        )
+
+
+def witness_trie_root(trie: WitnessBackedTrie) -> Root:
+    """
+    Compute the root hash of a witness-backed trie.
+
+    Uses the same encoding as mpt_root since both use MutableNode structure.
+
+    Parameters
+    ----------
+    trie :
+        The witness-backed trie.
+
+    Returns
+    -------
+    root : Root
+        The trie root hash.
+
+    """
+    if trie.root_node is None:
+        return EMPTY_TRIE_ROOT
+
+    root_encoded = _encode_mutable_node_to_extended(trie.root_node)
 
     if isinstance(root_encoded, Bytes):
         return Root(root_encoded)

@@ -39,7 +39,17 @@ from .fork import (
 from .fork_types import Address, Bloom, Root, VersionedHash
 from .requests import compute_requests_hash
 from .transactions import BlobTransaction, LegacyTransaction, decode_transaction
-from .trie import EMPTY_TRIE_ROOT, Trie, root, trie_set
+from .trie import (
+    EMPTY_TRIE_ROOT,
+    Trie,
+    WitnessBackedTrie,
+    build_witness_trie,
+    root,
+    trie_set,
+    witness_trie_get,
+    witness_trie_root,
+    witness_trie_set,
+)
 
 
 @dataclass
@@ -461,6 +471,80 @@ def block_from_new_payload_request(
     )
 
 
+def _build_node_map(nodes: List[Bytes]) -> Dict[Hash32, Bytes]:
+    """
+    Build a hash -> RLP node mapping from witness nodes.
+
+    Parameters
+    ----------
+    nodes :
+        List of RLP-encoded trie nodes from the witness.
+
+    Returns
+    -------
+    node_map :
+        Dictionary mapping node hash to RLP-encoded node.
+
+    """
+    node_map: Dict[Hash32, Bytes] = {}
+    for node_rlp in nodes:
+        node_hash = Hash32(keccak256(node_rlp))
+        node_map[node_hash] = node_rlp
+    return node_map
+
+
+def _build_bytecode_map(bytecodes: List[Bytes]) -> Dict[Hash32, Bytes]:
+    """
+    Build a code_hash -> bytecode mapping from witness bytecodes.
+
+    Parameters
+    ----------
+    bytecodes :
+        List of bytecodes from the witness.
+
+    Returns
+    -------
+    bytecode_map :
+        Dictionary mapping code hash to bytecode.
+
+    """
+    bytecode_map: Dict[Hash32, Bytes] = {}
+    for bytecode in bytecodes:
+        code_hash = Hash32(keccak256(bytecode))
+        bytecode_map[code_hash] = bytecode
+    return bytecode_map
+
+
+def _build_state_trie_from_witness(
+    node_map: Dict[Hash32, Bytes],
+    state_root: Root,
+) -> WitnessBackedTrie:
+    """
+    Build the main state trie from witness nodes.
+
+    This creates a WitnessBackedTrie that can be used for stateless execution.
+    The trie stores raw RLP-encoded account data in its leaves; decoding
+    to Account objects happens at access time.
+
+    Parameters
+    ----------
+    node_map :
+        Mapping from node hash to RLP-encoded node bytes.
+    state_root :
+        The state root from the parent block header.
+
+    Returns
+    -------
+    state_trie :
+        A witness-backed trie for the state.
+
+    """
+    return build_witness_trie(
+        node_map=node_map,
+        root_hash=state_root,
+    )
+
+
 def create_from_execution_witness(witness: ExecutionWitness) -> "BlockChain":
     """
     Create a BlockChain object from an ExecutionWitness.
@@ -479,13 +563,43 @@ def create_from_execution_witness(witness: ExecutionWitness) -> "BlockChain":
         The blockchain object initialized from the witness.
 
     """
-    # TODO: Implement this function to create a BlockChain from witness data.
-    # This requires:
-    # 1. Building the pre-state trie from witness nodes
+    # Step 1: Decode parent header to get state root
+    parent_header = rlp.decode_to(Header, witness.ancestors[0])
+    state_root = parent_header.state_root
+
+    # Step 2: Build node map from witness nodes
+    node_map = _build_node_map(witness.nodes)
+
+    # Step 3: Build bytecode map from witness bytecodes
+    bytecode_map = _build_bytecode_map(witness.bytecodes)
+
+    # Step 4: Build the pre-state trie from witness nodes
+    # This creates a WitnessBackedTrie that can be used for lookups and
+    # modifications during stateless execution.
+    state_trie = _build_state_trie_from_witness(node_map, state_root)
+
+    # Verify that the built trie has the expected root
+    built_root = witness_trie_root(state_trie)
+    if built_root != state_root:
+        raise InvalidBlock(
+            f"Built trie root {built_root.hex()} does not match "
+            f"expected state root {state_root.hex()}"
+        )
+
+    # TODO: Points 2 and 3 are not yet implemented:
     # 2. Creating a State object with the reconstructed trie
     # 3. Building a BlockChain object with the state and ancestor headers
+    #
+    # For now, we store the built trie components for future use:
+    # - state_trie: WitnessBackedTrie for account lookups
+    # - node_map: For building storage tries when needed
+    # - bytecode_map: For looking up contract code by hash
+    _ = state_trie  # Built state trie (point 1 complete)
+    _ = bytecode_map  # For code lookups
+    _ = node_map  # For storage trie building
+
     raise NotImplementedError(
-        "create_from_execution_witness is not yet implemented"
+        "create_from_execution_witness: points 2-3 not yet implemented"
     )
 
 
