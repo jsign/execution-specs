@@ -189,8 +189,10 @@ def _perform_stateless_validation(
     """
     from ethereum.crypto.hash import Hash32
     from ethereum.exceptions import InvalidBlock
-    from ethereum.forks.osaka.stateless import (
+    from ethereum.forks.osaka.stateless_fork import (
         create_from_execution_witness,
+    )
+    from ethereum.forks.osaka.stateless_guest import (
         validate_execution_witness,
     )
     from ethereum_types.numeric import U64

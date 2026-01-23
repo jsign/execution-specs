@@ -12,7 +12,7 @@ Entry point for the Ethereum specification.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 from ethereum_rlp import rlp
 from ethereum_types.bytes import Bytes
@@ -75,6 +75,7 @@ from .state import (
     track_block_hash_access,
     track_bytecode_access,
 )
+from .stateless_fork import WitnessBackedBlockChain
 from .transactions import (
     AccessListTransaction,
     BlobTransaction,
@@ -90,9 +91,6 @@ from .transactions import (
 )
 from .trie import root, trie_set
 from .utils.hexadecimal import hex_to_address
-
-if TYPE_CHECKING:
-    from .stateless import WitnessBackedBlockChain
 from .utils.message import prepare_message
 from .vm import Message
 from .vm.eoa_delegation import is_valid_delegation
@@ -169,7 +167,7 @@ def apply_fork(old: BlockChain) -> BlockChain:
 
 
 def get_last_256_block_hashes(
-    chain: Union[BlockChain, "WitnessBackedBlockChain"],
+    chain: Union[BlockChain, WitnessBackedBlockChain],
 ) -> List[Hash32]:
     """
     Obtain the list of hashes of the previous 256 blocks in order of
@@ -195,10 +193,10 @@ def get_last_256_block_hashes(
 
     """
     # Handle WitnessBackedBlockChain
-    if hasattr(chain, "_ancestors"):
+    if isinstance(chain, WitnessBackedBlockChain):
         # Witness-backed: ancestors are ordered parent-first (index 0 = parent)
         # Return in order of increasing block number (oldest first)
-        return list(reversed(chain._ancestor_hashes))  # type: ignore[union-attr]
+        return list(reversed(chain._ancestor_hashes))
 
     # Regular BlockChain
     recent_blocks = chain.blocks[-255:]
@@ -222,7 +220,7 @@ def get_last_256_block_hashes(
 
 
 def get_last_256_block_headers(
-    chain: Union[BlockChain, "WitnessBackedBlockChain"],
+    chain: Union[BlockChain, WitnessBackedBlockChain],
 ) -> List[Bytes]:
     """
     Obtain the list of RLP-encoded headers of the previous 256 blocks.
@@ -245,7 +243,7 @@ def get_last_256_block_headers(
 
     """
     # Handle WitnessBackedBlockChain
-    if hasattr(chain, "_ancestors"):
+    if isinstance(chain, WitnessBackedBlockChain):
         # Witness-backed: ancestors are ordered parent-first (index 0 = parent)
         # Return in order of increasing block number (oldest first)
         return list(reversed(chain._ancestors))
