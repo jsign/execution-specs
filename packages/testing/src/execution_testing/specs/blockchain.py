@@ -153,22 +153,12 @@ def _convert_execution_witness_for_validation(
 def _perform_stateless_validation(
     built_block: "BuiltBlock",
     parent_hash: Hash,
-    expected_state_root: Hash,
-    chain_id: int,
 ) -> None:
     """
     Perform full stateless validation using execution witness.
 
-    This validates that the witness can be used to reconstruct the pre-state
-    and (when fully implemented) re-execute the block to produce the same
-    state root.
-
-    Current validation:
-    1. Witness structure (nodes/bytecodes ordering, deduplication)
-    2. Ancestor chain validity (hashes form a valid chain from parent)
-    3. Pre-state trie reconstruction (witness nodes form valid trie with expected root)
-
-    Future (TODO): Full block re-execution using witness-backed state.
+    Uses stateless_state_transition from the specs to validate the block
+    can be executed with only the provided witness data.
 
     Parameters
     ----------
@@ -176,10 +166,6 @@ def _perform_stateless_validation(
         The built block containing the execution witness.
     parent_hash :
         Hash of the parent block.
-    expected_state_root :
-        Expected state root after block execution (for future full validation).
-    chain_id :
-        Chain ID for the blockchain.
 
     Raises
     ------
@@ -187,61 +173,32 @@ def _perform_stateless_validation(
         If stateless validation fails.
 
     """
-    from ethereum.crypto.hash import Hash32
-    from ethereum.exceptions import InvalidBlock
-    from ethereum.forks.osaka.stateless_fork import (
-        create_from_execution_witness,
-    )
-    from ethereum.forks.osaka.stateless_guest import (
-        validate_execution_witness,
-    )
-    from ethereum_types.numeric import U64
+    from ethereum.forks.osaka.blocks import StatelessInput
+    from ethereum.forks.osaka.stateless_guest import stateless_state_transition
 
     witness = built_block.result.execution_witness
     if witness is None:
         return  # Not an Osaka+ fork or witness not generated
 
-    specs_witness = _convert_execution_witness_for_validation(witness)
-    parent_hash_bytes = Hash32(bytes.fromhex(str(parent_hash)[2:]))
+    # Get Engine API parameters
+    fixture_payload = built_block.get_fixture_engine_new_payload()
+    params = fixture_payload.params
     block_number = built_block.header.number
 
-    # Step 1: Validate witness structure (ordering, deduplication, ancestor chain)
-    if not validate_execution_witness(specs_witness, parent_hash_bytes):
-        raise Exception(
-            f"ExecutionWitness validation failed for block {block_number}. "
-            f"Parent hash: {parent_hash}"
-        )
+    # Convert witness from hex strings to bytes
+    specs_witness = _convert_execution_witness_for_validation(witness)
 
-    try:
-        # Step 2: Build witness-backed blockchain from witness
-        # This validates that pre-state trie can be reconstructed with correct root.
-        witness_blockchain = create_from_execution_witness(
-            specs_witness,
-            chain_id=U64(chain_id),
-        )
-        _ = witness_blockchain  # Used for future full execution validation
+    # Create StatelessInput and run stateless state transition
+    stateless_input = StatelessInput(
+        new_payload_request=params,
+        witness=specs_witness,
+    )
+    result = stateless_state_transition(stateless_input)
 
-        # TODO: Full stateless execution validation
-        # Once state_transition is updated to work with WitnessBackedBlockChain,
-        # we can execute the block and verify the resulting state root matches
-        # expected_state_root:
-        #
-        # from ethereum.forks.osaka.fork import state_transition
-        # state_transition(witness_blockchain, block)
-        # post_state_root = witness_state_root(witness_blockchain.state)
-        # if post_state_root != expected_state_root:
-        #     raise InvalidBlock(...)
-        _ = expected_state_root  # Reserved for future full validation
-
-    except InvalidBlock as e:
+    if not result.success:
         raise Exception(
             f"Stateless validation failed for block {block_number} "
-            f"(parent: {parent_hash}): {e}"
-        )
-    except Exception as e:
-        raise Exception(
-            f"Stateless validation error for block {block_number} "
-            f"(parent: {parent_hash}): {e}"
+            f"(parent: {parent_hash})"
         )
 
 
@@ -970,8 +927,6 @@ class BlockchainTest(BaseTest):
             _perform_stateless_validation(
                 built_block,
                 parent_hash=head,
-                expected_state_root=built_block.state_root,
-                chain_id=self.chain_id,
             )
 
             # BAL verification already done in to_fixture_bal() if
@@ -1059,8 +1014,6 @@ class BlockchainTest(BaseTest):
             _perform_stateless_validation(
                 built_block,
                 parent_hash=head_hash,
-                expected_state_root=built_block.state_root,
-                chain_id=self.chain_id,
             )
             if block.exception is None:
                 alloc = built_block.alloc

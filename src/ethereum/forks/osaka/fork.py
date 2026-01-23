@@ -75,7 +75,7 @@ from .state import (
     track_block_hash_access,
     track_bytecode_access,
 )
-from .stateless_fork import WitnessBackedBlockChain
+from .stateless_fork import WitnessBackedBlockChain, witness_state_root
 from .transactions import (
     AccessListTransaction,
     BlobTransaction,
@@ -261,7 +261,9 @@ def get_last_256_block_headers(
     return recent_block_headers
 
 
-def state_transition(chain: BlockChain, block: Block) -> None:
+def state_transition(
+    chain: Union[BlockChain, WitnessBackedBlockChain], block: Block
+) -> None:
     """
     Attempts to apply a block to an existing block chain.
 
@@ -279,7 +281,8 @@ def state_transition(chain: BlockChain, block: Block) -> None:
     Parameters
     ----------
     chain :
-        History and current state.
+        History and current state. Can be either a regular BlockChain or a
+        WitnessBackedBlockChain for stateless execution.
     block :
         Block to apply to `chain`.
 
@@ -317,7 +320,10 @@ def state_transition(chain: BlockChain, block: Block) -> None:
         transactions=block.transactions,
         withdrawals=block.withdrawals,
     )
-    block_state_root = state_root(block_env.state)
+    if isinstance(chain, WitnessBackedBlockChain):
+        block_state_root = witness_state_root(chain.state)
+    else:
+        block_state_root = state_root(block_env.state)
     transactions_root = root(block_output.transactions_trie)
     receipt_root = root(block_output.receipts_trie)
     block_logs_bloom = logs_bloom(block_output.block_logs)
@@ -343,11 +349,12 @@ def state_transition(chain: BlockChain, block: Block) -> None:
     if requests_hash != block.header.requests_hash:
         raise InvalidBlock
 
-    chain.blocks.append(block)
-    if len(chain.blocks) > 255:
-        # Real clients have to store more blocks to deal with reorgs, but the
-        # protocol only requires the last 255
-        chain.blocks = chain.blocks[-255:]
+    if not isinstance(chain, WitnessBackedBlockChain):
+        chain.blocks.append(block)
+        if len(chain.blocks) > 255:
+            # Real clients have to store more blocks to deal with reorgs, but
+            # the protocol only requires the last 255
+            chain.blocks = chain.blocks[-255:]
 
 
 def calculate_base_fee_per_gas(
@@ -413,7 +420,32 @@ def calculate_base_fee_per_gas(
     return Uint(expected_base_fee_per_gas)
 
 
-def validate_header(chain: BlockChain, header: Header) -> None:
+def _get_parent_header(
+    chain: Union[BlockChain, WitnessBackedBlockChain]
+) -> Header:
+    """
+    Get parent header from either BlockChain or WitnessBackedBlockChain.
+
+    Parameters
+    ----------
+    chain :
+        Either a regular BlockChain or a WitnessBackedBlockChain.
+
+    Returns
+    -------
+    parent_header : Header
+        The parent block's header.
+
+    """
+    if isinstance(chain, WitnessBackedBlockChain):
+        return rlp.decode_to(Header, chain._ancestors[0])
+    else:
+        return chain.blocks[-1].header
+
+
+def validate_header(
+    chain: Union[BlockChain, WitnessBackedBlockChain], header: Header
+) -> None:
     """
     Verifies a block header.
 
@@ -435,7 +467,7 @@ def validate_header(chain: BlockChain, header: Header) -> None:
     if header.number < Uint(1):
         raise InvalidBlock
 
-    parent_header = chain.blocks[-1].header
+    parent_header = _get_parent_header(chain)
 
     excess_blob_gas = calculate_excess_blob_gas(parent_header)
     if header.excess_blob_gas != excess_blob_gas:

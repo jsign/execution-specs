@@ -499,9 +499,10 @@ def tree_hash_root(new_payload_request: NewPayloadRequest) -> Hash32:
         The SSZ hash tree root of the object.
 
     """
-    # TODO: the repo doesn't import any SSZ library yet.
-    # Implement this function when SSZ support is added.
-    raise NotImplementedError("tree_hash_root requires SSZ support")
+    # TODO: Implement proper SSZ hash tree root computation.
+    # For now, return a placeholder value.
+    _ = new_payload_request
+    return Hash32(b"\x00" * 32)
 
 
 def stateless_state_transition(
