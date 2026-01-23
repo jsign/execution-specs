@@ -12,7 +12,7 @@ Entry point for the Ethereum specification.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from ethereum_rlp import rlp
 from ethereum_types.bytes import Bytes
@@ -53,8 +53,6 @@ from .fork_types import (
     Account,
     Address,
     Authorization,
-    Bloom,
-    Root,
     VersionedHash,
 )
 from .requests import (
@@ -90,8 +88,11 @@ from .transactions import (
     recover_sender,
     validate_transaction,
 )
-from .trie import EMPTY_TRIE_ROOT, Trie, root, trie_set
+from .trie import root, trie_set
 from .utils.hexadecimal import hex_to_address
+
+if TYPE_CHECKING:
+    from .stateless import WitnessBackedBlockChain
 from .utils.message import prepare_message
 from .vm import Message
 from .vm.eoa_delegation import is_valid_delegation
@@ -167,7 +168,9 @@ def apply_fork(old: BlockChain) -> BlockChain:
     return old
 
 
-def get_last_256_block_hashes(chain: BlockChain) -> List[Hash32]:
+def get_last_256_block_hashes(
+    chain: Union[BlockChain, "WitnessBackedBlockChain"],
+) -> List[Hash32]:
     """
     Obtain the list of hashes of the previous 256 blocks in order of
     increasing block number.
@@ -177,10 +180,13 @@ def get_last_256_block_hashes(chain: BlockChain) -> List[Hash32]:
     The ``BLOCKHASH`` opcode needs to access the latest hashes on the chain,
     therefore this function retrieves them.
 
+    For WitnessBackedBlockChain, the hashes are derived from the ancestor
+    headers in the witness.
+
     Parameters
     ----------
     chain :
-        History and current state.
+        History and current state (either full BlockChain or witness-backed).
 
     Returns
     -------
@@ -188,6 +194,13 @@ def get_last_256_block_hashes(chain: BlockChain) -> List[Hash32]:
         Hashes of the recent 256 blocks in order of increasing block number.
 
     """
+    # Handle WitnessBackedBlockChain
+    if hasattr(chain, "_ancestors"):
+        # Witness-backed: ancestors are ordered parent-first (index 0 = parent)
+        # Return in order of increasing block number (oldest first)
+        return list(reversed(chain._ancestor_hashes))  # type: ignore[union-attr]
+
+    # Regular BlockChain
     recent_blocks = chain.blocks[-255:]
     # TODO: This function has not been tested rigorously
     if len(recent_blocks) == 0:
@@ -208,17 +221,22 @@ def get_last_256_block_hashes(chain: BlockChain) -> List[Hash32]:
     return recent_block_hashes
 
 
-def get_last_256_block_headers(chain: BlockChain) -> List[Bytes]:
+def get_last_256_block_headers(
+    chain: Union[BlockChain, "WitnessBackedBlockChain"],
+) -> List[Bytes]:
     """
     Obtain the list of RLP-encoded headers of the previous 256 blocks.
 
     This function will return less headers for the first 256 blocks.
     The headers are parallel to the hashes from get_last_256_block_hashes.
 
+    For WitnessBackedBlockChain, the headers are taken directly from the
+    witness ancestors.
+
     Parameters
     ----------
     chain :
-        History and current state.
+        History and current state (either full BlockChain or witness-backed).
 
     Returns
     -------
@@ -226,6 +244,13 @@ def get_last_256_block_headers(chain: BlockChain) -> List[Bytes]:
         RLP-encoded headers of recent 256 blocks in order of increasing number.
 
     """
+    # Handle WitnessBackedBlockChain
+    if hasattr(chain, "_ancestors"):
+        # Witness-backed: ancestors are ordered parent-first (index 0 = parent)
+        # Return in order of increasing block number (oldest first)
+        return list(reversed(chain._ancestors))
+
+    # Regular BlockChain
     recent_blocks = chain.blocks[-256:]
     if len(recent_blocks) == 0:
         return []

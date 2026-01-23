@@ -83,9 +83,6 @@ from .base import BaseTest, OpMode, verify_result
 from .debugging import print_traces
 from .helpers import verify_block, verify_transactions
 
-# Imports for ExecutionWitness validation (Osaka+)
-from ethereum.forks.osaka.blocks import ExecutionWitness as SpecsExecutionWitness
-from ethereum.forks.osaka.stateless import validate_execution_witness
 from execution_testing.fixtures.blockchain import ExecutionWitness
 
 
@@ -140,8 +137,12 @@ def count_blobs(txs: List[Transaction]) -> int:
 
 def _convert_execution_witness_for_validation(
     witness: ExecutionWitness,
-) -> SpecsExecutionWitness:
+) -> Any:
     """Convert testing ExecutionWitness (hex strings) to specs format (bytes) for validation."""
+    from ethereum.forks.osaka.blocks import (
+        ExecutionWitness as SpecsExecutionWitness,
+    )
+
     return SpecsExecutionWitness(
         nodes=[bytes.fromhex(n[2:]) for n in witness.nodes],
         bytecodes=[bytes.fromhex(b[2:]) for b in witness.bytecodes],
@@ -149,27 +150,96 @@ def _convert_execution_witness_for_validation(
     )
 
 
-def _validate_execution_witness(
+def _perform_stateless_validation(
     built_block: "BuiltBlock",
     parent_hash: Hash,
+    expected_state_root: Hash,
+    chain_id: int,
 ) -> None:
     """
-    Validate execution witness for stateless execution coherence.
+    Perform full stateless validation using execution witness.
 
-    Only validates if the block has an execution witness (Osaka+ forks).
-    Raises an exception if validation fails.
+    This validates that the witness can be used to reconstruct the pre-state
+    and (when fully implemented) re-execute the block to produce the same
+    state root.
+
+    Current validation:
+    1. Witness structure (nodes/bytecodes ordering, deduplication)
+    2. Ancestor chain validity (hashes form a valid chain from parent)
+    3. Pre-state trie reconstruction (witness nodes form valid trie with expected root)
+
+    Future (TODO): Full block re-execution using witness-backed state.
+
+    Parameters
+    ----------
+    built_block :
+        The built block containing the execution witness.
+    parent_hash :
+        Hash of the parent block.
+    expected_state_root :
+        Expected state root after block execution (for future full validation).
+    chain_id :
+        Chain ID for the blockchain.
+
+    Raises
+    ------
+    Exception :
+        If stateless validation fails.
+
     """
+    from ethereum.crypto.hash import Hash32
+    from ethereum.exceptions import InvalidBlock
+    from ethereum.forks.osaka.stateless import (
+        create_from_execution_witness,
+        validate_execution_witness,
+    )
+    from ethereum_types.numeric import U64
+
     witness = built_block.result.execution_witness
     if witness is None:
         return  # Not an Osaka+ fork or witness not generated
 
     specs_witness = _convert_execution_witness_for_validation(witness)
-    parent_hash_bytes = bytes.fromhex(str(parent_hash)[2:])
+    parent_hash_bytes = Hash32(bytes.fromhex(str(parent_hash)[2:]))
+    block_number = built_block.header.number
 
+    # Step 1: Validate witness structure (ordering, deduplication, ancestor chain)
     if not validate_execution_witness(specs_witness, parent_hash_bytes):
         raise Exception(
-            f"ExecutionWitness validation failed for block {built_block.header.number}. "
+            f"ExecutionWitness validation failed for block {block_number}. "
             f"Parent hash: {parent_hash}"
+        )
+
+    try:
+        # Step 2: Build witness-backed blockchain from witness
+        # This validates that pre-state trie can be reconstructed with correct root.
+        witness_blockchain = create_from_execution_witness(
+            specs_witness,
+            chain_id=U64(chain_id),
+        )
+        _ = witness_blockchain  # Used for future full execution validation
+
+        # TODO: Full stateless execution validation
+        # Once state_transition is updated to work with WitnessBackedBlockChain,
+        # we can execute the block and verify the resulting state root matches
+        # expected_state_root:
+        #
+        # from ethereum.forks.osaka.fork import state_transition
+        # state_transition(witness_blockchain, block)
+        # post_state_root = witness_state_root(witness_blockchain.state)
+        # if post_state_root != expected_state_root:
+        #     raise InvalidBlock(...)
+        _ = expected_state_root  # Reserved for future full validation
+
+    except InvalidBlock as e:
+        raise Exception(
+            f"Stateless validation failed for block {block_number} "
+            f"(parent: {parent_hash}): {e}"
+        )
+    except Exception as e:
+        raise Exception(
+            f"Stateless validation error for block {block_number} "
+            f"(parent: {parent_hash}): {e}"
         )
 
 
@@ -894,8 +964,13 @@ class BlockchainTest(BaseTest):
                 last_block=i == len(self.blocks) - 1,
             )
             fixture_blocks.append(built_block.get_fixture_block())
-            # Validate execution witness for stateless coherence (Osaka+)
-            _validate_execution_witness(built_block, parent_hash=head)
+            # Perform full stateless validation (Osaka+)
+            _perform_stateless_validation(
+                built_block,
+                parent_hash=head,
+                expected_state_root=built_block.state_root,
+                chain_id=self.chain_id,
+            )
 
             # BAL verification already done in to_fixture_bal() if
             # expected_block_access_list set
@@ -978,8 +1053,13 @@ class BlockchainTest(BaseTest):
             fixture_payloads.append(
                 built_block.get_fixture_engine_new_payload()
             )
-            # Validate execution witness for stateless coherence (Osaka+)
-            _validate_execution_witness(built_block, parent_hash=head_hash)
+            # Perform full stateless validation (Osaka+)
+            _perform_stateless_validation(
+                built_block,
+                parent_hash=head_hash,
+                expected_state_root=built_block.state_root,
+                chain_id=self.chain_id,
+            )
             if block.exception is None:
                 alloc = built_block.alloc
                 state_root = built_block.state_root

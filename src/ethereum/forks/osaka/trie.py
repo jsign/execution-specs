@@ -233,8 +233,9 @@ class WitnessBackedTrie:
     root_node :
         The mutable tree structure built from witness nodes.
     witness :
-        Always None for witness-backed tries (we consume witnesses, not generate).
-        Present for compatibility with _mpt_insert_node/_mpt_delete_node.
+        Always None for witness-backed tries (we consume witnesses,
+        not generate). For compatibility with _mpt_insert_node.
+
     """
 
     root_node: MutableNode = None
@@ -797,7 +798,7 @@ def _invalidate_hash(node: MutableNode) -> None:
     if node is None:
         return
     if isinstance(node, StubNode):
-        # Should never happen - traversal should have raised InvalidBlock earlier
+        # Should not happen - traversal raises InvalidBlock earlier
         raise InvalidBlock(
             f"Attempted to invalidate hash of StubNode {node.node_hash.hex()}"
         )
@@ -1344,7 +1345,7 @@ def _collapse_branch(
             # Can't collapse with a stub - we don't know if it's a leaf,
             # extension, or branch, so we can't merge correctly.
             raise InvalidBlock(
-                f"Cannot collapse branch: sibling is stub {child.node_hash.hex()}"
+                f"Cannot collapse branch: stub {child.node_hash.hex()}"
             )
         elif isinstance(child, MutableLeafNode):
             return MutableLeafNode(
@@ -1410,7 +1411,7 @@ def _build_mutable_from_witness(
     node_map :
         Mapping from node hash to RLP-encoded node bytes.
     node_ref :
-        Reference to the current node (32-byte hash or embedded RLP < 32 bytes).
+        Reference to the current node (32-byte hash or embedded RLP).
     path_so_far :
         Accumulated nibble path from the root to this node.
 
@@ -1429,8 +1430,8 @@ def _build_mutable_from_witness(
         # 32-byte hash reference
         node_hash = Hash32(node_ref)
         if node_hash not in node_map:
-            # Hash not in witness - create a stub that preserves the hash
-            # This allows root computation but will raise InvalidBlock on access
+            # Hash not in witness - create a stub preserving the hash
+            # Allows root computation but raises InvalidBlock on access
             return StubNode(node_hash=node_hash)
         node_rlp = node_map[node_hash]
         decoded = rlp.decode(node_rlp)

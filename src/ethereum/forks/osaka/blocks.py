@@ -406,7 +406,6 @@ def decode_receipt(receipt: Bytes | Receipt) -> Receipt:
         return receipt
 
 
-
 @slotted_freezable
 @dataclass
 class ExecutionWitness:
