@@ -10,12 +10,13 @@ chain.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Tuple
 
 from ethereum_rlp import rlp
 from ethereum_types.bytes import Bytes, Bytes8, Bytes32
 from ethereum_types.frozen import slotted_freezable
 from ethereum_types.numeric import U64, U256, Uint
+from execution_testing.fixtures.blockchain import EngineNewPayloadParameters
 
 from ethereum.crypto.hash import Hash32
 
@@ -403,3 +404,39 @@ def decode_receipt(receipt: Bytes | Receipt) -> Receipt:
         return rlp.decode_to(Receipt, receipt[1:])
     else:
         return receipt
+
+
+@slotted_freezable
+@dataclass
+class ExecutionWitness:
+    """
+    Execution witness for stateless block validation.
+
+    Contains all data needed to validate a block without full state access.
+    """
+
+    nodes: List[Bytes]
+    """RLP-encoded trie nodes for pre-state reconstruction."""
+
+    bytecodes: List[Bytes]
+    """Contract bytecodes accessed during execution."""
+
+    ancestors: List[Bytes]
+    """RLP-encoded ancestor block headers."""
+
+
+NewPayloadRequest = EngineNewPayloadParameters
+
+
+@slotted_freezable
+@dataclass
+class StatelessInput:
+    """
+    Input for stateless state transition execution.
+    """
+
+    new_payload_request: NewPayloadRequest
+    """The Engine API new payload request."""
+
+    witness: ExecutionWitness
+    """The execution witness containing pre-state data."""

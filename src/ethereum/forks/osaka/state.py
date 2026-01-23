@@ -1048,13 +1048,14 @@ def generate_witness(state: State) -> Tuple[Root, Witness]:
     main_mpt = ws._main_mpt
     storage_mpts = ws._storage_mpts
 
-    # Collect ancestors from oldest accessed block to parent (inclusive)
+    # Collect ancestors from parent (newest) to oldest accessed block
     # All headers in this range needed for parent hash chain validation
+    # Order: [parent, grandparent, ..., oldest] per EIP spec
     ancestors: List[Bytes] = []
     assert ws.oldest_accessed_block is not None and ws.block_headers
-    # Include all headers from oldest accessed to parent (block_number - 1)
+    # Include all headers from parent down to oldest accessed block
     for block_num in range(
-        int(ws.oldest_accessed_block), int(ws.current_block_number)
+        int(ws.current_block_number) - 1, int(ws.oldest_accessed_block) - 1, -1
     ):
         offset = int(ws.current_block_number) - block_num
         if offset <= len(ws.block_headers):

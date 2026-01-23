@@ -14,7 +14,7 @@ Types reused throughout the specification, which are specific to Ethereum.
 from dataclasses import dataclass
 
 from ethereum_rlp import rlp
-from ethereum_types.bytes import Bytes, Bytes20, Bytes256
+from ethereum_types.bytes import Bytes, Bytes20, Bytes256, FixedBytes
 from ethereum_types.frozen import slotted_freezable
 from ethereum_types.numeric import U8, U64, U256, Uint
 
@@ -76,3 +76,13 @@ class Authorization:
     y_parity: U8
     r: U256
     s: U256
+
+
+class UncompressedPublicKey(FixedBytes):
+    """
+    Uncompressed secp256k1 public key.
+
+    65 bytes: 0x04 prefix + 32-byte X coordinate + 32-byte Y coordinate.
+    """
+
+    LENGTH = 65
