@@ -1447,14 +1447,17 @@ def _build_mutable_from_witness(
             child_ref = decoded[i]
             if child_ref == b"":
                 children.append(None)
-            else:
+            elif isinstance(child_ref, bytes):
                 child_path = path_so_far + Bytes([i])
                 child_node = _build_mutable_from_witness(
                     node_map, child_ref, child_path
                 )
                 children.append(child_node)
+            else:
+                raise InvalidBlock("Invalid branch node child reference")
 
-        value = decoded[16] if decoded[16] != b"" else b""
+        branch_value = decoded[16]
+        value = branch_value if isinstance(branch_value, bytes) else b""
         return MutableBranchNode(children=children, value=value)
 
     elif len(decoded) == 2:
@@ -1472,6 +1475,8 @@ def _build_mutable_from_witness(
         else:
             # Extension node - recurse on child
             child_ref = decoded[1]
+            if not isinstance(child_ref, bytes):
+                raise InvalidBlock("Invalid extension node child reference")
             child_node = _build_mutable_from_witness(
                 node_map, child_ref, path_so_far + nibbles
             )

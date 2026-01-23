@@ -20,7 +20,7 @@ from execution_testing.fixtures.blockchain import EngineNewPayloadParameters
 
 from ethereum.crypto.hash import Hash32
 
-from .fork_types import Address, Bloom, Root, UncompressedPublicKey
+from .fork_types import Address, Bloom, Root
 from .transactions import (
     AccessListTransaction,
     BlobTransaction,
@@ -440,6 +440,3 @@ class StatelessInput:
 
     witness: ExecutionWitness
     """The execution witness containing pre-state data."""
-
-    public_keys: List[UncompressedPublicKey]
-    """Public keys for signature verification."""

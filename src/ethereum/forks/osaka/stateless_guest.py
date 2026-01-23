@@ -15,7 +15,7 @@ full state access.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple, Union
+from typing import Any, Dict, List, Set, Tuple, Union, cast
 
 from ethereum_rlp import rlp
 from ethereum_types.bytes import Bytes, Bytes8, Bytes32
@@ -32,7 +32,7 @@ from .blocks import (
     StatelessInput,
     Withdrawal,
 )
-from .fork import EMPTY_OMMER_HASH, state_transition
+from .fork import EMPTY_OMMER_HASH, BlockChain, state_transition
 from .fork_types import (
     Address,
     Bloom,
@@ -118,6 +118,8 @@ def validate_new_payload_params(
         True if the parameters are valid.
 
     """
+    # V5 format has 4 elements: (payload, blob_hashes, beacon_root, requests)
+    assert len(new_payload_request) == 4
     execution_payload = new_payload_request[0]
     expected_blob_hashes = new_payload_request[1]
     execution_requests = new_payload_request[3]
@@ -245,7 +247,7 @@ def _verify_node_recursive(
     node_rlp = node_map[node_hash]
 
     try:
-        decoded: Union[Bytes, List] = rlp.decode(node_rlp)
+        decoded: Union[Bytes, List[Any]] = rlp.decode(node_rlp)  # type: ignore[assignment]
 
         if not isinstance(decoded, list):
             return False
@@ -404,6 +406,8 @@ def block_from_new_payload_request(
         The block constructed from the payload.
 
     """
+    # V5 format has 4 elements: (payload, blob_hashes, beacon_root, requests)
+    assert len(new_payload_request) == 4
     execution_payload = new_payload_request[0]
     parent_beacon_block_root = new_payload_request[2]
     execution_requests = new_payload_request[3]
@@ -441,7 +445,7 @@ def block_from_new_payload_request(
     transactions_root = root(transactions_trie)
 
     # Compute requests hash
-    requests_hash = compute_requests_hash(list(execution_requests))
+    requests_hash = Hash32(compute_requests_hash(list(execution_requests)))
 
     header = Header(
         parent_hash=Hash32(execution_payload.parent_hash),
@@ -466,6 +470,11 @@ def block_from_new_payload_request(
         parent_beacon_block_root=Root(parent_beacon_block_root),
         requests_hash=requests_hash,
     )
+
+    # Verify block hash matches
+    computed_hash = keccak256(rlp.encode(header))
+    if computed_hash != Hash32(execution_payload.block_hash):
+        raise InvalidBlock("Block hash mismatch")
 
     return Block(
         header=header,
@@ -547,7 +556,7 @@ def stateless_state_transition(
     # Create blockchain from witness and execute
     blockchain = create_from_execution_witness(stateless_input.witness)
     try:
-        state_transition(blockchain, block)
+        state_transition(cast(BlockChain, blockchain), block)
         success = True
     except InvalidBlock:
         success = False

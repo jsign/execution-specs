@@ -218,8 +218,9 @@ def _decode_account_data_from_witness(
 
     """
     decoded = rlp.decode(encoded)
-    nonce = Uint(decoded[0])
-    balance = U256(decoded[1])
+    assert isinstance(decoded, list)
+    nonce = Uint(int.from_bytes(decoded[0], "big") if decoded[0] else 0)
+    balance = U256(int.from_bytes(decoded[1], "big") if decoded[1] else 0)
     storage_root = Root(decoded[2])
     code_hash = Hash32(decoded[3])
 
@@ -514,7 +515,12 @@ def witness_get_storage(
     if encoded is None:
         value = U256(0)
     else:
-        value = U256(rlp.decode(encoded))
+        decoded_value = rlp.decode(encoded)
+        assert isinstance(decoded_value, bytes)
+        if decoded_value:
+            value = U256(int.from_bytes(decoded_value, "big"))
+        else:
+            value = U256(0)
 
     # Cache the value in diff layer
     state._diff._storage.setdefault(address, {})[key] = value
