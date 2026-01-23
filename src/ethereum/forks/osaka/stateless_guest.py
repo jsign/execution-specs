@@ -43,7 +43,6 @@ from .requests import compute_requests_hash
 from .stateless_fork import create_from_execution_witness
 from .transactions import (
     BlobTransaction,
-    LegacyTransaction,
     decode_transaction,
 )
 from .trie import (
@@ -430,7 +429,7 @@ def block_from_new_payload_request(
     withdrawals_root = root(withdrawals_trie)
 
     # Prepare transactions
-    transactions: Tuple[Bytes | LegacyTransaction, ...] = tuple(
+    transactions: Tuple[Bytes, ...] = tuple(
         Bytes(tx) for tx in execution_payload.transactions
     )
 

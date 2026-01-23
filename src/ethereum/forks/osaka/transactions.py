@@ -519,6 +519,8 @@ def decode_transaction(tx: LegacyTransaction | Bytes) -> Transaction:
             return rlp.decode_to(BlobTransaction, tx[1:])
         elif tx[0] == 4:
             return rlp.decode_to(SetCodeTransaction, tx[1:])
+        elif tx[0] >= 0xC0:
+            return rlp.decode_to(LegacyTransaction, tx)
         else:
             raise TransactionTypeError(tx[0])
     else:
