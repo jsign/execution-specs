@@ -1510,6 +1510,84 @@ def build_witness_trie(
     return WitnessBackedTrie(root_node=root_node)
 
 
+def _copy_mutable_node(node: MutableNode) -> MutableNode:
+    """
+    Deep copy a mutable node tree.
+
+    Creates a complete copy of the node and all its descendants,
+    allowing independent modification of the copy without affecting
+    the original tree.
+
+    Parameters
+    ----------
+    node :
+        The node to copy (can be any MutableNode type or None).
+
+    Returns
+    -------
+    copy : MutableNode
+        A deep copy of the node tree.
+
+    """
+    if node is None:
+        return None
+
+    if isinstance(node, StubNode):
+        return StubNode(node_hash=node.node_hash)
+
+    if isinstance(node, MutableLeafNode):
+        return MutableLeafNode(
+            rest_of_key=node.rest_of_key,
+            value=node.value,
+            _hash=node._hash,
+            _rlp=node._rlp,
+        )
+
+    if isinstance(node, MutableExtensionNode):
+        return MutableExtensionNode(
+            key_segment=node.key_segment,
+            child=_copy_mutable_node(node.child),
+            _hash=None,  # Invalidate cache since child may change
+            _rlp=None,
+        )
+
+    if isinstance(node, MutableBranchNode):
+        return MutableBranchNode(
+            children=[_copy_mutable_node(c) for c in node.children],
+            value=node.value,
+            _hash=None,  # Invalidate cache since children may change
+            _rlp=None,
+        )
+
+    raise AssertionError(f"Unknown mutable node type: {type(node)}")
+
+
+def copy_witness_trie(trie: WitnessBackedTrie) -> WitnessBackedTrie:
+    """
+    Create a deep copy of a witness-backed trie.
+
+    This creates a complete copy of the trie that can be modified
+    independently without affecting the original. Used for state
+    root computation where we apply diffs to a copy rather than
+    modifying the original base layer trie.
+
+    Parameters
+    ----------
+    trie :
+        The witness-backed trie to copy.
+
+    Returns
+    -------
+    copy : WitnessBackedTrie
+        A deep copy of the trie.
+
+    """
+    return WitnessBackedTrie(
+        root_node=_copy_mutable_node(trie.root_node),
+        witness=None,
+    )
+
+
 def _witness_trie_traverse(
     node: MutableNode,
     nibble_key: Bytes,

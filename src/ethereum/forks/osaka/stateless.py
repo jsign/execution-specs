@@ -34,13 +34,10 @@ from .blocks import (
 )
 from .fork import EMPTY_OMMER_HASH, state_transition
 from .fork_types import (
-    EMPTY_ACCOUNT,
-    Account,
     Address,
     Bloom,
     Root,
     VersionedHash,
-    encode_account,
 )
 from .requests import compute_requests_hash
 from .transactions import (
@@ -53,6 +50,7 @@ from .trie import (
     Trie,
     WitnessBackedTrie,
     build_witness_trie,
+    copy_witness_trie,
     root,
     trie_set,
     witness_trie_get,
@@ -61,29 +59,145 @@ from .trie import (
 )
 
 
-@dataclass
-class WitnessBackedState:
+class _Deleted:
     """
-    State implementation backed by witness tries for stateless execution.
+    Sentinel value to mark an entry as explicitly deleted.
 
-    Unlike the full State class which stores accounts in a regular Trie,
-    this uses WitnessBackedTrie for lookups and modifications. Storage tries
-    are built lazily from the witness node_map when first accessed.
+    Used in the diff layer to distinguish between:
+    - Key not in cache (need to fetch from base layer)
+    - Key explicitly deleted (return None/zero)
+    - Key exists with a value
+    """
 
-    The trie stores raw RLP-encoded account data (nonce, balance,
-    storage_root, code_hash). Bytecode is looked up from bytecode_map.
+    pass
+
+
+DELETED = _Deleted()
+"""Singleton sentinel for deleted entries."""
+
+
+EMPTY_CODE_HASH = Hash32(keccak256(b""))
+"""Hash of empty bytecode."""
+
+
+@dataclass
+class AccountData:
+    """
+    Account data as stored in the witness trie (without actual bytecode).
+
+    The witness trie stores accounts as RLP(nonce, balance, storage_root, code_hash).
+    We store nonce, balance, code_hash here. Storage root is derived from storage trie.
+
+    This separates account data from bytecode, allowing witnesses that only
+    include bytecode when code is actually executed.
+    """
+
+    nonce: Uint
+    balance: U256
+    code_hash: Hash32
+
+
+@dataclass
+class WitnessBaseLayer:
+    """
+    Immutable pre-state layer built from execution witness.
+
+    This layer is NEVER modified during EVM execution. It provides
+    pre-state data for accounts, storage, and bytecode from the witness.
+
+    Queries that hit missing witness data (StubNode) will raise
+    InvalidBlock - we do NOT return default values for missing data.
     """
 
     _main_trie: WitnessBackedTrie
-    _storage_tries: Dict[Address, WitnessBackedTrie] = field(
+    """Read-only state trie built from witness nodes."""
+
+    _node_map: Dict[Hash32, Bytes] = field(default_factory=dict)
+    """Mapping from node hash to RLP-encoded node (for building storage tries)."""
+
+    _bytecode_map: Dict[Hash32, Bytes] = field(default_factory=dict)
+    """Mapping from code hash to bytecode."""
+
+    _storage_tries_cache: Dict[Address, WitnessBackedTrie] = field(
         default_factory=dict
     )
-    _node_map: Dict[Hash32, Bytes] = field(default_factory=dict)
-    _bytecode_map: Dict[Hash32, Bytes] = field(default_factory=dict)
-    _snapshots: List[
-        Tuple[WitnessBackedTrie, Dict[Address, WitnessBackedTrie]]
-    ] = field(default_factory=list)
+    """Lazily built storage tries from witness (read-only after built)."""
+
+
+@dataclass
+class DiffLayer:
+    """
+    Mutable cache/diff layer for EVM execution.
+
+    EVM execution accesses this layer first. If data is not present,
+    it's fetched from the base layer and cached here. All modifications
+    are written to this layer only.
+
+    Uses DELETED sentinel to distinguish "deleted" from "not cached".
+    Separates account data from bytecode for lazy bytecode loading.
+    """
+
+    _accounts: Dict[Address, Union[AccountData, _Deleted]] = field(
+        default_factory=dict
+    )
+    """
+    Account data cache. Maps address to:
+    - AccountData: account exists (nonce, balance, code_hash)
+    - DELETED: account was explicitly deleted
+    Key not in dict means not yet fetched from base layer.
+    """
+
+    _storage: Dict[Address, Dict[Bytes32, U256]] = field(default_factory=dict)
+    """
+    Storage cache. Maps address -> (slot -> value).
+    U256(0) means the slot is empty/deleted (same semantics in Ethereum).
+    Key not in inner dict means not yet fetched from base layer.
+    """
+
+    _bytecodes: Dict[Hash32, Bytes] = field(default_factory=dict)
+    """
+    Bytecode cache. Maps code_hash -> bytecode.
+    Lazily populated when bytecode is actually needed (CALL, EXTCODESIZE, etc.).
+    New bytecodes from CREATE/CREATE2 are also stored here.
+    """
+
+    _dirty_accounts: Set[Address] = field(default_factory=set)
+    """Accounts that were modified (need to be included in state root)."""
+
+    _dirty_storage: Dict[Address, Set[Bytes32]] = field(default_factory=dict)
+    """Storage slots that were modified per account."""
+
     created_accounts: Set[Address] = field(default_factory=set)
+    """Accounts created in current transaction (for EIP-6780 SELFDESTRUCT)."""
+
+
+@dataclass
+class WitnessBackedState:
+    """
+    Two-layer state implementation for stateless execution.
+
+    Layer 1 (Base): Immutable witness data (pre-state)
+    Layer 2 (Diff): Mutable cache/modifications (runtime state)
+
+    The EVM accesses state through this class, which implements
+    a two-layer lookup pattern:
+    1. Check diff layer first
+    2. If not present, fetch from base layer and cache
+    3. Write operations only modify the diff layer
+
+    At block end, state root is computed by applying diffs to
+    trie copies in the correct order (inserts/updates first,
+    deletions after) to avoid branch compression issues.
+    """
+
+    _base: WitnessBaseLayer
+    """Immutable pre-state from witness."""
+
+    _diff: DiffLayer
+    """Mutable cache and modifications."""
+
+    _snapshots: List[DiffLayer] = field(default_factory=list)
+    """Stack of diff layer snapshots for transaction rollback."""
 
 
 @dataclass
@@ -101,27 +215,25 @@ class WitnessBackedBlockChain:
     chain_id: U64
 
 
-def _decode_account_from_witness(
+def _decode_account_data_from_witness(
     encoded: Bytes,
-    bytecode_map: Dict[Hash32, Bytes],
-) -> Tuple[Account, Root]:
+) -> Tuple[AccountData, Root]:
     """
-    Decode an account from witness trie leaf value.
+    Decode account data from witness trie leaf value.
 
     The witness trie stores accounts as RLP(nonce, balance, storage_root,
-    code_hash). The actual bytecode must be looked up from bytecode_map.
+    code_hash). This function extracts just the account data WITHOUT looking
+    up the actual bytecode - bytecode is fetched lazily when needed.
 
     Parameters
     ----------
     encoded :
         RLP-encoded account data from witness trie.
-    bytecode_map :
-        Mapping from code_hash to bytecode.
 
     Returns
     -------
-    account : Account
-        The decoded account with code populated from bytecode_map.
+    account_data : AccountData
+        The decoded account data (nonce, balance, code_hash).
     storage_root : Root
         The storage root for building the storage trie.
 
@@ -132,21 +244,8 @@ def _decode_account_from_witness(
     storage_root = Root(decoded[2])
     code_hash = Hash32(decoded[3])
 
-    # Look up code from bytecode_map
-    # Empty code has hash keccak256(b"") which may not be in bytecode_map
-    empty_code_hash = Hash32(keccak256(b""))
-    if code_hash == empty_code_hash:
-        code = b""
-    elif code_hash in bytecode_map:
-        code = bytecode_map[code_hash]
-    else:
-        # Code hash not in witness - incomplete witness
-        raise InvalidBlock(
-            f"Code hash {code_hash.hex()} not in witness bytecode_map"
-        )
-
-    account = Account(nonce=nonce, balance=balance, code=code)
-    return account, storage_root
+    account_data = AccountData(nonce=nonce, balance=balance, code_hash=code_hash)
+    return account_data, storage_root
 
 
 def _get_storage_root_from_encoded_account(encoded: Bytes) -> Root:
@@ -155,14 +254,26 @@ def _get_storage_root_from_encoded_account(encoded: Bytes) -> Root:
     return Root(decoded[2])
 
 
+EMPTY_ACCOUNT_DATA = AccountData(
+    nonce=Uint(0),
+    balance=U256(0),
+    code_hash=EMPTY_CODE_HASH,
+)
+"""Default data for non-existent accounts."""
+
+
 def witness_get_account_optional(
     state: WitnessBackedState,
     address: Address,
-) -> Optional[Account]:
+) -> Optional[AccountData]:
     """
-    Get an account from witness-backed state.
+    Get account data from witness-backed state using two-layer lookup.
 
-    Returns None if the account doesn't exist (proven by witness structure).
+    1. Check diff layer first
+    2. If not in diff, fetch from base layer and cache
+    3. Return None if account doesn't exist (proven by witness structure)
+
+    Does NOT fetch bytecode - use witness_get_code() when bytecode is needed.
     Raises InvalidBlock if witness is incomplete (hits StubNode).
 
     Parameters
@@ -174,35 +285,111 @@ def witness_get_account_optional(
 
     Returns
     -------
-    account : Optional[Account]
-        The account at address, or None if it doesn't exist.
+    account_data : Optional[AccountData]
+        The account data at address, or None if it doesn't exist.
 
     """
-    encoded = witness_trie_get(state._main_trie, address)
+    if address in state._diff._accounts:
+        value = state._diff._accounts[address]
+        if isinstance(value, _Deleted):
+            return None
+        return value
+
+    encoded = witness_trie_get(state._base._main_trie, address)
+
     if encoded is None:
         return None
 
-    account, _ = _decode_account_from_witness(encoded, state._bytecode_map)
-    return account
+    account_data, _ = _decode_account_data_from_witness(encoded)
+    state._diff._accounts[address] = account_data
+    return account_data
 
 
 def witness_get_account(
     state: WitnessBackedState, address: Address
-) -> Account:
-    """Get account from witness-backed state, or EMPTY_ACCOUNT if not found."""
-    account = witness_get_account_optional(state, address)
-    if account is None:
-        return EMPTY_ACCOUNT
-    return account
+) -> AccountData:
+    """Get account data, or EMPTY_ACCOUNT_DATA if not found."""
+    account_data = witness_get_account_optional(state, address)
+    if account_data is None:
+        return EMPTY_ACCOUNT_DATA
+    return account_data
+
+
+def witness_get_code(
+    state: WitnessBackedState,
+    address: Address,
+) -> Bytes:
+    """
+    Get bytecode for an account using lazy two-layer lookup.
+
+    Bytecode is fetched only when actually needed (CALL, EXTCODESIZE, etc.),
+    not when account data is retrieved.
+
+    1. Get account data to find code_hash
+    2. If empty code hash -> return b""
+    3. Check diff layer bytecode cache first
+    4. If not cached -> look up from base layer bytecode_map
+    5. If not in bytecode_map -> fail with InvalidBlock (incomplete witness)
+
+    Parameters
+    ----------
+    state :
+        The witness-backed state.
+    address :
+        Address of the account.
+
+    Returns
+    -------
+    code : Bytes
+        The bytecode, or b"" if empty.
+
+    Raises
+    ------
+    InvalidBlock
+        If bytecode is needed but not present in witness.
+
+    """
+    account_data = witness_get_account_optional(state, address)
+    if account_data is None:
+        return b""  # Non-existent account has no code
+
+    code_hash = account_data.code_hash
+
+    # Empty code
+    if code_hash == EMPTY_CODE_HASH:
+        return b""
+
+    # Check diff layer cache first
+    if code_hash in state._diff._bytecodes:
+        return state._diff._bytecodes[code_hash]
+
+    # Look up from base layer
+    if code_hash in state._base._bytecode_map:
+        code = state._base._bytecode_map[code_hash]
+        # Cache in diff layer
+        state._diff._bytecodes[code_hash] = code
+        return code
+
+    # Bytecode not in witness - incomplete witness for this operation
+    raise InvalidBlock(
+        f"Bytecode for code_hash {code_hash.hex()} not in witness. "
+        "Witness is incomplete for operations requiring this bytecode."
+    )
 
 
 def witness_set_account(
     state: WitnessBackedState,
     address: Address,
-    account: Optional[Account],
+    account_data: Optional[AccountData],
 ) -> None:
     """
-    Set an account in witness-backed state.
+    Set account data in witness-backed state (diff layer only).
+
+    Does NOT modify the base layer. All modifications go to the diff layer
+    and are applied during state root computation.
+
+    For new accounts with code (CREATE/CREATE2), the caller should also
+    call witness_set_code() to store the bytecode.
 
     Parameters
     ----------
@@ -210,39 +397,62 @@ def witness_set_account(
         The witness-backed state.
     address :
         Address to set.
-    account :
-        Account to set, or None to delete.
+    account_data :
+        Account data to set, or None to delete.
 
     """
-    if account is None:
-        # Delete account and its storage trie
-        witness_trie_set(state._main_trie, address, b"")
-        if address in state._storage_tries:
-            del state._storage_tries[address]
+    if account_data is None:
+        # Mark account as deleted in diff layer
+        state._diff._accounts[address] = DELETED
+        state._diff._storage.pop(address, None)
+        state._diff._dirty_storage.pop(address, None)
     else:
-        # Get current storage root (or empty if new account)
-        current_encoded = witness_trie_get(state._main_trie, address)
-        if current_encoded is not None:
-            storage_root = _get_storage_root_from_encoded_account(
-                current_encoded
-            )
-        else:
-            storage_root = EMPTY_TRIE_ROOT
+        state._diff._accounts[address] = account_data
 
-        # Encode and set
-        encoded = encode_account(account, storage_root)
-        witness_trie_set(state._main_trie, address, encoded)
+    state._diff._dirty_accounts.add(address)
 
 
-def _get_or_build_storage_trie(
+def witness_set_code(
+    state: WitnessBackedState,
+    code: Bytes,
+) -> Hash32:
+    """
+    Store bytecode in the diff layer and return its hash.
+
+    Used when deploying new contracts (CREATE/CREATE2) to store the
+    bytecode for later retrieval.
+
+    Parameters
+    ----------
+    state :
+        The witness-backed state.
+    code :
+        The bytecode to store.
+
+    Returns
+    -------
+    code_hash : Hash32
+        The keccak256 hash of the bytecode.
+
+    """
+    code_hash = Hash32(keccak256(code))
+    if code_hash != EMPTY_CODE_HASH:
+        state._diff._bytecodes[code_hash] = code
+    return code_hash
+
+
+def _get_base_storage_trie(
     state: WitnessBackedState,
     address: Address,
 ) -> WitnessBackedTrie:
     """
-    Get or lazily build a storage trie for an account.
+    Get or lazily build a storage trie from the base (witness) layer.
 
     If the storage trie hasn't been built yet, it's constructed from
     the witness node_map using the account's storage_root.
+
+    This trie is for READ-ONLY access from the base layer. It should
+    NOT be modified during execution.
 
     Parameters
     ----------
@@ -254,25 +464,27 @@ def _get_or_build_storage_trie(
     Returns
     -------
     storage_trie : WitnessBackedTrie
-        The storage trie for the account.
+        The storage trie for the account from the base layer.
 
     """
-    if address in state._storage_tries:
-        return state._storage_tries[address]
+    if address in state._base._storage_tries_cache:
+        return state._base._storage_tries_cache[address]
 
-    # Get account's storage root
-    encoded = witness_trie_get(state._main_trie, address)
+    # Get account's storage root from base layer
+    encoded = witness_trie_get(state._base._main_trie, address)
     if encoded is None:
-        # Account doesn't exist - create empty storage trie
+        # Account doesn't exist in base layer - empty storage trie
         storage_trie = WitnessBackedTrie(root_node=None)
     else:
         storage_root = _get_storage_root_from_encoded_account(encoded)
         if storage_root == EMPTY_TRIE_ROOT:
             storage_trie = WitnessBackedTrie(root_node=None)
         else:
-            storage_trie = build_witness_trie(state._node_map, storage_root)
+            storage_trie = build_witness_trie(
+                state._base._node_map, storage_root
+            )
 
-    state._storage_tries[address] = storage_trie
+    state._base._storage_tries_cache[address] = storage_trie
     return storage_trie
 
 
@@ -282,7 +494,11 @@ def witness_get_storage(
     key: Bytes32,
 ) -> U256:
     """
-    Get a storage value from witness-backed state.
+    Get a storage value from witness-backed state using two-layer lookup.
+
+    1. Check diff layer first
+    2. If not in diff, fetch from base layer and cache
+    3. Return U256(0) if slot doesn't exist
 
     Parameters
     ----------
@@ -299,11 +515,29 @@ def witness_get_storage(
         Storage value, or U256(0) if not set.
 
     """
-    storage_trie = _get_or_build_storage_trie(state, address)
+    # Check diff layer first
+    if address in state._diff._storage:
+        storage_cache = state._diff._storage[address]
+        if key in storage_cache:
+            return storage_cache[key]  # U256(0) means empty/deleted
+
+    # Check if account is deleted in diff
+    if address in state._diff._accounts:
+        if isinstance(state._diff._accounts[address], _Deleted):
+            return U256(0)  # Account deleted, storage is zero
+
+    # Fetch from base layer
+    storage_trie = _get_base_storage_trie(state, address)
     encoded = witness_trie_get(storage_trie, key)
+
     if encoded is None:
-        return U256(0)
-    return U256(rlp.decode(encoded))
+        value = U256(0)
+    else:
+        value = U256(rlp.decode(encoded))
+
+    # Cache the value in diff layer
+    state._diff._storage.setdefault(address, {})[key] = value
+    return value
 
 
 def witness_set_storage(
@@ -313,9 +547,10 @@ def witness_set_storage(
     value: U256,
 ) -> None:
     """
-    Set a storage value in witness-backed state.
+    Set a storage value in witness-backed state (diff layer only).
 
-    Also updates the account's storage_root in the main trie.
+    Does NOT modify the base layer. All modifications go to the diff layer
+    and are applied during state root computation.
 
     Parameters
     ----------
@@ -329,43 +564,107 @@ def witness_set_storage(
         Storage value. U256(0) deletes the key.
 
     """
-    storage_trie = _get_or_build_storage_trie(state, address)
-
-    if value == U256(0):
-        witness_trie_set(storage_trie, key, b"")
-    else:
-        witness_trie_set(storage_trie, key, rlp.encode(value))
-
-    # Update account's storage root in main trie
-    new_storage_root = witness_trie_root(storage_trie)
-    encoded = witness_trie_get(state._main_trie, address)
-    assert encoded is not None, "Cannot set storage for non-existent account"
-    account, _ = _decode_account_from_witness(encoded, state._bytecode_map)
-    new_encoded = encode_account(account, new_storage_root)
-    witness_trie_set(state._main_trie, address, new_encoded)
+    state._diff._storage.setdefault(address, {})[key] = value
+    state._diff._dirty_storage.setdefault(address, set()).add(key)
 
 
-def witness_state_root(state: WitnessBackedState) -> Root:
+def _copy_diff_layer(diff: DiffLayer) -> DiffLayer:
     """
-    Compute the state root from witness-backed state.
+    Create a deep copy of the diff layer for snapshotting.
+
+    AccountData, U256, and Bytes objects are immutable/frozen, so shallow
+    copies of the inner dicts are sufficient.
+
+    Parameters
+    ----------
+    diff :
+        The diff layer to copy.
+
+    Returns
+    -------
+    copy : DiffLayer
+        A deep copy of the diff layer.
+
+    """
+    return DiffLayer(
+        _accounts=dict(diff._accounts),
+        _storage={addr: dict(slots) for addr, slots in diff._storage.items()},
+        _bytecodes=dict(diff._bytecodes),
+        _dirty_accounts=set(diff._dirty_accounts),
+        _dirty_storage={
+            addr: set(keys) for addr, keys in diff._dirty_storage.items()
+        },
+        created_accounts=set(diff.created_accounts),
+    )
+
+
+def witness_begin_transaction(
+    state: WitnessBackedState,
+    transient_storage: object,
+) -> None:
+    """
+    Snapshot the diff layer before a nested call.
+
+    Used for transaction/call depth handling - if the call reverts,
+    we can restore the diff layer from the snapshot.
 
     Parameters
     ----------
     state :
         The witness-backed state.
-
-    Returns
-    -------
-    root : Root
-        The state root.
+    transient_storage :
+        Transient storage (passed for API compatibility with State).
 
     """
-    return witness_trie_root(state._main_trie)
+    state._snapshots.append(_copy_diff_layer(state._diff))
 
 
-def witness_storage_root(state: WitnessBackedState, address: Address) -> Root:
+def witness_commit_transaction(
+    state: WitnessBackedState,
+    transient_storage: object,
+) -> None:
     """
-    Compute the storage root for an account.
+    Discard the snapshot on successful return from a nested call.
+
+    Parameters
+    ----------
+    state :
+        The witness-backed state.
+    transient_storage :
+        Transient storage (passed for API compatibility with State).
+
+    """
+    state._snapshots.pop()
+    if not state._snapshots:
+        state._diff.created_accounts.clear()
+
+
+def witness_rollback_transaction(
+    state: WitnessBackedState,
+    transient_storage: object,
+) -> None:
+    """
+    Restore the diff layer from a snapshot on revert.
+
+    Parameters
+    ----------
+    state :
+        The witness-backed state.
+    transient_storage :
+        Transient storage (passed for API compatibility with State).
+
+    """
+    state._diff = state._snapshots.pop()
+    if not state._snapshots:
+        state._diff.created_accounts.clear()
+
+
+def _get_base_storage_root(
+    state: WitnessBackedState,
+    address: Address,
+) -> Root:
+    """
+    Get the storage root for an account from the base layer.
 
     Parameters
     ----------
@@ -377,13 +676,84 @@ def witness_storage_root(state: WitnessBackedState, address: Address) -> Root:
     Returns
     -------
     root : Root
-        The storage root.
+        The storage root from the base layer.
 
     """
-    if address in state._storage_tries:
-        return witness_trie_root(state._storage_tries[address])
-    return EMPTY_TRIE_ROOT
+    encoded = witness_trie_get(state._base._main_trie, address)
+    if encoded is None:
+        return EMPTY_TRIE_ROOT
+    return _get_storage_root_from_encoded_account(encoded)
 
+
+def witness_state_root(state: WitnessBackedState) -> Root:
+    """
+    Compute the state root by applying diffs to base layer tries.
+
+    Parameters
+    ----------
+    state :
+        The witness-backed state.
+
+    Returns
+    -------
+    root : Root
+        The computed state root.
+
+    """
+    # Build working copies of tries for root computation
+    # to avoid modifying the actual base layer
+    main_trie = copy_witness_trie(state._base._main_trie)
+    storage_tries: Dict[Address, WitnessBackedTrie] = {}
+
+    # Process dirty storage
+    for address, dirty_keys in state._diff._dirty_storage.items():
+        # Get or copy storage trie from base layer
+        if address not in storage_tries:
+            base_trie = _get_base_storage_trie(state, address)
+            storage_tries[address] = copy_witness_trie(base_trie)
+
+        storage_trie = storage_tries[address]
+        storage_cache = state._diff._storage.get(address, {})
+
+        # First pass: inserts and updates
+        for key in dirty_keys:
+            value = storage_cache.get(key, U256(0))
+            if value != U256(0):
+                witness_trie_set(storage_trie, key, rlp.encode(value))
+
+        # Second pass: deletions (U256(0) means empty/deleted in Ethereum)
+        for key in dirty_keys:
+            value = storage_cache.get(key, U256(0))
+            if value == U256(0):
+                witness_trie_set(storage_trie, key, b"")  # Delete
+
+    # Process dirty accounts
+    for address in state._diff._dirty_accounts:
+        account_data = state._diff._accounts.get(address)
+        assert account_data is not None, "dirty account can't be non-existent"
+        if not isinstance(account_data, _Deleted):
+            # Get storage root for this account
+            if address in storage_tries:
+                storage_root = witness_trie_root(storage_tries[address])
+            else:
+                # If address had dirty storage, it would be in storage_tries
+                assert address not in state._diff._dirty_storage
+                storage_root = _get_base_storage_root(state, address)
+
+            # Encode account using code_hash directly (no bytecode needed!)
+            encoded = rlp.encode((
+                account_data.nonce,
+                account_data.balance,
+                storage_root,
+                account_data.code_hash,
+            ))
+            witness_trie_set(main_trie, address, encoded)
+
+    # Note: No deletion pass needed. Since EIP-6780, SELFDESTRUCT only deletes
+    # accounts created in the same transaction. Such accounts were never in the
+    # pre-state trie, so there's nothing to delete from main_trie.
+
+    return witness_trie_root(main_trie)
 
 
 @dataclass
@@ -934,14 +1304,25 @@ def create_from_execution_witness(
         Hash32(keccak256(ancestor_rlp)) for ancestor_rlp in witness.ancestors
     ]
 
-    # Step 6: Create witness-backed state
-    state = WitnessBackedState(
+    # Step 6: Create witness-backed state with two-layer architecture
+    base_layer = WitnessBaseLayer(
         _main_trie=state_trie,
-        _storage_tries={},
         _node_map=node_map,
         _bytecode_map=bytecode_map,
-        _snapshots=[],
+        _storage_tries_cache={},
+    )
+    diff_layer = DiffLayer(
+        _accounts={},
+        _storage={},
+        _bytecodes={},
+        _dirty_accounts=set(),
+        _dirty_storage={},
         created_accounts=set(),
+    )
+    state = WitnessBackedState(
+        _base=base_layer,
+        _diff=diff_layer,
+        _snapshots=[],
     )
 
     # Step 7: Return witness-backed blockchain
