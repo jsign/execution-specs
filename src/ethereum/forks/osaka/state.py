@@ -942,12 +942,19 @@ def _build_witness_mpts(state: State) -> None:
         get_storage_root=get_pre_storage_root,
     )
 
-    # 1. Do read-only storages accesses
-    for address, accessed_keys in ws.accessed_storage.items():
+    # 1. Traverse all accessed and dirty storage keys on the pre-state
+    # MPTs to capture pre-state trie nodes in the witness. This must
+    # happen before any writes since writes mutate the tree in-place.
+    all_storage_reads: Dict[Address, Set[Bytes32]] = {}
+    for address, keys in ws.accessed_storage.items():
+        all_storage_reads.setdefault(address, set()).update(keys)
+    for address, keys in ws.dirty_storage.items():
+        all_storage_reads.setdefault(address, set()).update(keys)
+
+    for address, keys in all_storage_reads.items():
         if address not in storage_mpts:
             continue
-
-        for key in accessed_keys:
+        for key in keys:
             mpt_get(storage_mpts[address], key)
 
     # 2. Apply dirty storage to storages (writes)
@@ -978,8 +985,9 @@ def _build_witness_mpts(state: State) -> None:
     # - Storage changed (storage root changed) - tracked in dirty_storage
     all_dirty_accounts = ws.dirty_accounts | set(ws.dirty_storage.keys())
 
-    # 3. Traverse accounts that were read
-    for address in ws.accessed_accounts:
+    # 3. Traverse all accessed and dirty accounts on the pre-state MPT
+    # to capture pre-state trie nodes before writes mutate the tree.
+    for address in ws.accessed_accounts | all_dirty_accounts:
         mpt_get(main_mpt, address)
 
     # 4. Apply dirty accounts

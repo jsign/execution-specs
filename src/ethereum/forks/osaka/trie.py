@@ -950,8 +950,6 @@ def _mpt_insert_node(
 
     Returns the new/updated node for this position.
     """
-    _record_witness(mpt.witness, node)
-
     if node is None:
         # Empty slot - create new leaf
         return MutableLeafNode(rest_of_key=key[level:], value=value)
@@ -1134,8 +1132,6 @@ def _mpt_delete_node(
 
     Returns the updated node (may be different type or None).
     """
-    _record_witness(mpt.witness, node)
-
     if node is None:
         return None
 
