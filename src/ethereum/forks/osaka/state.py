@@ -878,6 +878,26 @@ def is_witness_mode_enabled(state: State) -> bool:
     return state._witness_state is not None
 
 
+def _debug_print_witness_state(ws: WitnessState) -> None:
+    """Print dirty/accessed accounts and storage in hex format."""
+    _hex = lambda b: "0x" + b.hex()
+    _hex_set = lambda s: (
+        "{" + ", ".join(sorted(_hex(x) for x in s)) + "}"
+    )
+    _hex_dict_set = lambda d: (
+        "{\n"
+        + "".join(
+            f"    {_hex(k)}: {_hex_set(v)}\n"
+            for k, v in sorted(d.items(), key=lambda kv: kv[0].hex())
+        )
+        + "  }"
+    )
+    print("dirty_accounts:", _hex_set(ws.dirty_accounts))
+    print("dirty_storage:", _hex_dict_set(ws.dirty_storage))
+    print("accessed_accounts:", _hex_set(ws.accessed_accounts))
+    print("accessed_storage:", _hex_dict_set(ws.accessed_storage))
+
+
 def _build_witness_mpts(state: State) -> None:
     """
     Build and cache the IncrementalMPTs for witness generation.
@@ -894,6 +914,8 @@ def _build_witness_mpts(state: State) -> None:
     """
     assert state._witness_state is not None
     ws = state._witness_state
+
+    _debug_print_witness_state(ws)
 
     # Already built
     if ws._main_mpt is not None:
