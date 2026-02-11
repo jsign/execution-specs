@@ -882,7 +882,9 @@ def _debug_print_witness_state(ws: WitnessState) -> None:
     """Print dirty/accessed accounts and storage in hex format."""
     _hex = lambda b: "0x" + b.hex()
     _hex_set = lambda s: (
-        "{" + ", ".join(sorted(_hex(x) for x in s)) + "}"
+        "{\n"
+        + "".join(f"    {_hex(x)}\n" for x in sorted(s, key=lambda b: b.hex()))
+        + "  }"
     )
     _hex_dict_set = lambda d: (
         "{\n"
@@ -915,11 +917,11 @@ def _build_witness_mpts(state: State) -> None:
     assert state._witness_state is not None
     ws = state._witness_state
 
-    _debug_print_witness_state(ws)
-
     # Already built
     if ws._main_mpt is not None:
         return
+
+    _debug_print_witness_state(ws)
 
     # Build pre-block storage MPTs
     storage_mpts: Dict[Address, IncrementalMPT[Bytes32, U256]] = {}
