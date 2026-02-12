@@ -1063,7 +1063,8 @@ def process_withdrawals(
             rlp.encode(wd),
         )
 
-        modify_state(block_env.state, wd.address, increase_recipient_balance)
+        if wd.amount != 0:
+            modify_state(block_env.state, wd.address, increase_recipient_balance)
 
 
 def check_gas_limit(gas_limit: Uint, parent_gas_limit: Uint) -> bool:
