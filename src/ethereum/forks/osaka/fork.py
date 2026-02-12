@@ -575,8 +575,12 @@ def check_transaction(
 
     if Uint(sender_account.balance) < max_gas_fee + Uint(tx.value):
         raise InsufficientBalanceError("insufficient sender balance")
-    if sender_account.code and not is_valid_delegation(sender_account.code):
-        raise InvalidSenderError("not EOA")
+    if sender_account.code:
+        track_bytecode_access(
+            block_env.state, sender_account.code, sender_address
+        )
+        if not is_valid_delegation(sender_account.code):
+            raise InvalidSenderError("not EOA")
 
     return (
         sender_address,
