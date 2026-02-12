@@ -192,8 +192,10 @@ def set_delegation(message: Message) -> U256:
         authority_account = get_account(state, authority)
         authority_code = authority_account.code
 
-        if authority_code and not is_valid_delegation(authority_code):
-            continue
+        if authority_code:
+            track_bytecode_access(state, authority_code, authority)
+            if not is_valid_delegation(authority_code):
+                continue
 
         authority_nonce = authority_account.nonce
         if authority_nonce != auth.nonce:
