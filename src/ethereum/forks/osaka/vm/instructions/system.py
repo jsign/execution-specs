@@ -536,6 +536,8 @@ def selfdestruct(evm: Evm) -> None:
         evm.accessed_addresses.add(beneficiary)
         gas_cost += GAS_COLD_ACCOUNT_ACCESS
 
+    charge_gas(evm, gas_cost)
+
     if (
         not is_account_alive(evm.message.block_env.state, beneficiary)
         and get_account(
@@ -543,9 +545,7 @@ def selfdestruct(evm: Evm) -> None:
         ).balance
         != 0
     ):
-        gas_cost += GAS_SELF_DESTRUCT_NEW_ACCOUNT
-
-    charge_gas(evm, gas_cost)
+        charge_gas(evm, GAS_SELF_DESTRUCT_NEW_ACCOUNT)
     if evm.message.is_static:
         raise WriteInStaticContext
 
