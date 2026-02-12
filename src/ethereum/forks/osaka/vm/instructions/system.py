@@ -25,6 +25,7 @@ from ...state import (
     is_account_alive,
     move_ether,
     set_account_balance,
+    track_bytecode_access,
 )
 from ...utils.address import (
     compute_contract_address,
@@ -288,7 +289,6 @@ def generic_call(
     memory_input_size: U256,
     memory_output_start_position: U256,
     memory_output_size: U256,
-    code: Bytes,
     disable_precompiles: bool,
 ) -> None:
     """
@@ -302,6 +302,9 @@ def generic_call(
         evm.gas_left += gas
         push(evm.stack, U256(0))
         return
+
+    code = get_account(evm.message.block_env.state, code_address).code
+    track_bytecode_access(evm.message.block_env.state, code, code_address)
 
     call_data = memory_read_bytes(
         evm.memory, memory_input_start_position, memory_input_size
@@ -383,7 +386,6 @@ def call(evm: Evm) -> None:
     (
         disable_precompiles,
         code_address,
-        code,
         delegated_access_gas_cost,
     ) = access_delegation(evm, code_address)
     access_gas_cost += delegated_access_gas_cost
@@ -424,7 +426,6 @@ def call(evm: Evm) -> None:
             memory_input_size,
             memory_output_start_position,
             memory_output_size,
-            code,
             disable_precompiles,
         )
 
@@ -471,7 +472,6 @@ def callcode(evm: Evm) -> None:
     (
         disable_precompiles,
         code_address,
-        code,
         delegated_access_gas_cost,
     ) = access_delegation(evm, code_address)
     access_gas_cost += delegated_access_gas_cost
@@ -509,7 +509,6 @@ def callcode(evm: Evm) -> None:
             memory_input_size,
             memory_output_start_position,
             memory_output_size,
-            code,
             disable_precompiles,
         )
 
@@ -613,7 +612,6 @@ def delegatecall(evm: Evm) -> None:
     (
         disable_precompiles,
         code_address,
-        code,
         delegated_access_gas_cost,
     ) = access_delegation(evm, code_address)
     access_gas_cost += delegated_access_gas_cost
@@ -638,7 +636,6 @@ def delegatecall(evm: Evm) -> None:
         memory_input_size,
         memory_output_start_position,
         memory_output_size,
-        code,
         disable_precompiles,
     )
 
@@ -683,7 +680,6 @@ def staticcall(evm: Evm) -> None:
     (
         disable_precompiles,
         code_address,
-        code,
         delegated_access_gas_cost,
     ) = access_delegation(evm, code_address)
     access_gas_cost += delegated_access_gas_cost
@@ -712,7 +708,6 @@ def staticcall(evm: Evm) -> None:
         memory_input_size,
         memory_output_start_position,
         memory_output_size,
-        code,
         disable_precompiles,
     )
 

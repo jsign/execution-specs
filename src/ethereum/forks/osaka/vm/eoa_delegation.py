@@ -122,7 +122,7 @@ def recover_authority(authorization: Authorization) -> Address:
 
 def access_delegation(
     evm: Evm, address: Address
-) -> Tuple[bool, Address, Bytes, Uint]:
+) -> Tuple[bool, Address, Uint]:
     """
     Get the delegation address, code, and the cost of access from the address.
 
@@ -144,7 +144,7 @@ def access_delegation(
     code = get_account(state, address).code
     track_bytecode_access(state, code, address)
     if not is_valid_delegation(code):
-        return False, address, code, Uint(0)
+        return False, address, Uint(0)
 
     address = Address(code[EOA_DELEGATION_MARKER_LENGTH:])
     if address in evm.accessed_addresses:
@@ -152,10 +152,8 @@ def access_delegation(
     else:
         evm.accessed_addresses.add(address)
         access_gas_cost = GAS_COLD_ACCOUNT_ACCESS
-    code = get_account(state, address).code
-    track_bytecode_access(state, code, address)
 
-    return True, address, code, access_gas_cost
+    return True, address, access_gas_cost
 
 
 def set_delegation(message: Message) -> U256:
