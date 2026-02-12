@@ -132,7 +132,9 @@ def process_message_call(message: Message) -> MessageCallOutput:
             message.disable_precompiles = True
             message.accessed_addresses.add(delegated_address)
             message.code = get_account(block_env.state, delegated_address).code
-            track_bytecode_access(block_env.state, message.code)
+            track_bytecode_access(
+                block_env.state, message.code, delegated_address
+            )
             message.code_address = delegated_address
 
         evm = process_message(message)

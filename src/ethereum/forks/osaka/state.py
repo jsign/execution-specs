@@ -297,7 +297,9 @@ def destroy_account(state: State, address: Address) -> None:
     set_account(state, address, None)
 
 
-def track_bytecode_access(state: State, code: Bytes) -> None:
+def track_bytecode_access(
+    state: State, code: Bytes, address: Optional[Address] = None
+) -> None:
     """
     Track bytecode access for execution witness generation.
 
@@ -310,16 +312,28 @@ def track_bytecode_access(state: State, code: Bytes) -> None:
         The state with optional witness tracking.
     code : Bytes
         The bytecode being accessed.
+    address : Optional[Address]
+        Account address whose code is being accessed. When provided,
+        only pre-block code for this address is included in witness
+        bytecodes.
 
     """
     # Skip if witness mode disabled or empty bytecode (EOAs)
     if state._witness_state is None or len(code) == 0:
         return
 
+    ws = state._witness_state
+
+    # Exclude bytecode that was created or changed during the current block.
+    if address is not None:
+        pre_account = ws.pre_state_accounts.get(address)
+        if pre_account is None or pre_account.code != code:
+            return
+
     # Compute hash and store for deduplication
     code_hash = Bytes32(keccak256(code))
-    if code_hash not in state._witness_state.accessed_bytecodes:
-        state._witness_state.accessed_bytecodes[code_hash] = code
+    if code_hash not in ws.accessed_bytecodes:
+        ws.accessed_bytecodes[code_hash] = code
 
 
 def track_block_hash_access(state: State, block_number: Uint) -> None:

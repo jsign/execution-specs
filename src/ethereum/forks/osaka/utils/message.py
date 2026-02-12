@@ -63,7 +63,7 @@ def prepare_message(
         current_target = tx.to
         msg_data = tx.data
         code = get_account(block_env.state, tx.to).code
-        track_bytecode_access(block_env.state, code)
+        track_bytecode_access(block_env.state, code, tx.to)
         code_address = tx.to
     else:
         raise AssertionError("Target must be address or empty bytes")
