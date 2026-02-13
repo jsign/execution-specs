@@ -348,6 +348,32 @@ def generic_call(
     )
 
 
+def call_access_gas_cost(
+    evm: Evm,
+    address: Address,
+    extend_memory_cost: Uint,
+    transfer_gas_cost: Uint = GAS_ZERO,
+) -> Uint:
+    """
+    Return warm/cold access cost for call-family opcodes.
+
+    This mirrors client behavior where a cold account lookup can be skipped
+    when there is not enough gas to cover the cold-account access cost after
+    mandatory pre-call costs.
+    """
+    if address in evm.accessed_addresses:
+        return GAS_WARM_ACCESS
+
+    if (
+        evm.gas_left
+        < extend_memory_cost + transfer_gas_cost + GAS_COLD_ACCOUNT_ACCESS
+    ):
+        raise OutOfGasError
+
+    evm.accessed_addresses.add(address)
+    return GAS_COLD_ACCOUNT_ACCESS
+
+
 def call(evm: Evm) -> None:
     """
     Message-call into an account.
@@ -376,11 +402,14 @@ def call(evm: Evm) -> None:
         ],
     )
 
-    if to in evm.accessed_addresses:
-        access_gas_cost = GAS_WARM_ACCESS
-    else:
-        evm.accessed_addresses.add(to)
-        access_gas_cost = GAS_COLD_ACCOUNT_ACCESS
+    transfer_gas_cost = Uint(0) if value == 0 else GAS_CALL_VALUE
+
+    access_gas_cost = call_access_gas_cost(
+        evm,
+        to,
+        extend_memory.cost,
+        transfer_gas_cost,
+    )
 
     code_address = to
     (
@@ -393,7 +422,6 @@ def call(evm: Evm) -> None:
     create_gas_cost = GAS_NEW_ACCOUNT
     if value == 0 or is_account_alive(evm.message.block_env.state, to):
         create_gas_cost = Uint(0)
-    transfer_gas_cost = Uint(0) if value == 0 else GAS_CALL_VALUE
     message_call_gas = calculate_message_call_gas(
         value,
         gas,
@@ -463,11 +491,14 @@ def callcode(evm: Evm) -> None:
         ],
     )
 
-    if code_address in evm.accessed_addresses:
-        access_gas_cost = GAS_WARM_ACCESS
-    else:
-        evm.accessed_addresses.add(code_address)
-        access_gas_cost = GAS_COLD_ACCOUNT_ACCESS
+    transfer_gas_cost = Uint(0) if value == 0 else GAS_CALL_VALUE
+
+    access_gas_cost = call_access_gas_cost(
+        evm,
+        code_address,
+        extend_memory.cost,
+        transfer_gas_cost,
+    )
 
     (
         disable_precompiles,
@@ -476,7 +507,6 @@ def callcode(evm: Evm) -> None:
     ) = access_delegation(evm, code_address)
     access_gas_cost += delegated_access_gas_cost
 
-    transfer_gas_cost = Uint(0) if value == 0 else GAS_CALL_VALUE
     message_call_gas = calculate_message_call_gas(
         value,
         gas,
@@ -603,11 +633,11 @@ def delegatecall(evm: Evm) -> None:
         ],
     )
 
-    if code_address in evm.accessed_addresses:
-        access_gas_cost = GAS_WARM_ACCESS
-    else:
-        evm.accessed_addresses.add(code_address)
-        access_gas_cost = GAS_COLD_ACCOUNT_ACCESS
+    access_gas_cost = call_access_gas_cost(
+        evm,
+        code_address,
+        extend_memory.cost,
+    )
 
     (
         disable_precompiles,
@@ -670,11 +700,11 @@ def staticcall(evm: Evm) -> None:
         ],
     )
 
-    if to in evm.accessed_addresses:
-        access_gas_cost = GAS_WARM_ACCESS
-    else:
-        evm.accessed_addresses.add(to)
-        access_gas_cost = GAS_COLD_ACCOUNT_ACCESS
+    access_gas_cost = call_access_gas_cost(
+        evm,
+        to,
+        extend_memory.cost,
+    )
 
     code_address = to
     (
