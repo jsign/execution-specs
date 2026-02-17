@@ -575,8 +575,12 @@ def check_transaction(
 
     if Uint(sender_account.balance) < max_gas_fee + Uint(tx.value):
         raise InsufficientBalanceError("insufficient sender balance")
-    if sender_account.code and not is_valid_delegation(sender_account.code):
-        raise InvalidSenderError("not EOA")
+    if sender_account.code:
+        track_bytecode_access(
+            block_env.state, sender_account.code, sender_address
+        )
+        if not is_valid_delegation(sender_account.code):
+            raise InvalidSenderError("not EOA")
 
     return (
         sender_address,
@@ -1063,7 +1067,8 @@ def process_withdrawals(
             rlp.encode(wd),
         )
 
-        modify_state(block_env.state, wd.address, increase_recipient_balance)
+        if wd.amount != 0:
+            modify_state(block_env.state, wd.address, increase_recipient_balance)
 
 
 def check_gas_limit(gas_limit: Uint, parent_gas_limit: Uint) -> bool:

@@ -297,7 +297,9 @@ def destroy_account(state: State, address: Address) -> None:
     set_account(state, address, None)
 
 
-def track_bytecode_access(state: State, code: Bytes) -> None:
+def track_bytecode_access(
+    state: State, code: Bytes, address: Optional[Address] = None
+) -> None:
     """
     Track bytecode access for execution witness generation.
 
@@ -310,16 +312,28 @@ def track_bytecode_access(state: State, code: Bytes) -> None:
         The state with optional witness tracking.
     code : Bytes
         The bytecode being accessed.
+    address : Optional[Address]
+        Account address whose code is being accessed. When provided,
+        only pre-block code for this address is included in witness
+        bytecodes.
 
     """
     # Skip if witness mode disabled or empty bytecode (EOAs)
     if state._witness_state is None or len(code) == 0:
         return
 
+    ws = state._witness_state
+
+    # Exclude bytecode that was created or changed during the current block.
+    if address is not None:
+        pre_account = ws.pre_state_accounts.get(address)
+        if pre_account is None or pre_account.code != code:
+            return
+
     # Compute hash and store for deduplication
     code_hash = Bytes32(keccak256(code))
-    if code_hash not in state._witness_state.accessed_bytecodes:
-        state._witness_state.accessed_bytecodes[code_hash] = code
+    if code_hash not in ws.accessed_bytecodes:
+        ws.accessed_bytecodes[code_hash] = code
 
 
 def track_block_hash_access(state: State, block_number: Uint) -> None:
@@ -878,6 +892,28 @@ def is_witness_mode_enabled(state: State) -> bool:
     return state._witness_state is not None
 
 
+def _debug_print_witness_state(ws: WitnessState) -> None:
+    """Print dirty/accessed accounts and storage in hex format."""
+    _hex = lambda b: "0x" + b.hex()
+    _hex_set = lambda s: (
+        "{\n"
+        + "".join(f"    {_hex(x)}\n" for x in sorted(s, key=lambda b: b.hex()))
+        + "  }"
+    )
+    _hex_dict_set = lambda d: (
+        "{\n"
+        + "".join(
+            f"    {_hex(k)}: {_hex_set(v)}\n"
+            for k, v in sorted(d.items(), key=lambda kv: kv[0].hex())
+        )
+        + "  }"
+    )
+    print("dirty_accounts:", _hex_set(ws.dirty_accounts))
+    print("dirty_storage:", _hex_dict_set(ws.dirty_storage))
+    print("accessed_accounts:", _hex_set(ws.accessed_accounts))
+    print("accessed_storage:", _hex_dict_set(ws.accessed_storage))
+
+
 def _build_witness_mpts(state: State) -> None:
     """
     Build and cache the IncrementalMPTs for witness generation.
@@ -899,6 +935,8 @@ def _build_witness_mpts(state: State) -> None:
     if ws._main_mpt is not None:
         return
 
+    _debug_print_witness_state(ws)
+
     # Build pre-block storage MPTs
     storage_mpts: Dict[Address, IncrementalMPT[Bytes32, U256]] = {}
     for address, data in ws.pre_state_storages.items():
@@ -918,12 +956,19 @@ def _build_witness_mpts(state: State) -> None:
         get_storage_root=get_pre_storage_root,
     )
 
-    # 1. Do read-only storages accesses
-    for address, accessed_keys in ws.accessed_storage.items():
+    # 1. Traverse all accessed and dirty storage keys on the pre-state
+    # MPTs to capture pre-state trie nodes in the witness. This must
+    # happen before any writes since writes mutate the tree in-place.
+    all_storage_reads: Dict[Address, Set[Bytes32]] = {}
+    for address, keys in ws.accessed_storage.items():
+        all_storage_reads.setdefault(address, set()).update(keys)
+    for address, keys in ws.dirty_storage.items():
+        all_storage_reads.setdefault(address, set()).update(keys)
+
+    for address, keys in all_storage_reads.items():
         if address not in storage_mpts:
             continue
-
-        for key in accessed_keys:
+        for key in keys:
             mpt_get(storage_mpts[address], key)
 
     # 2. Apply dirty storage to storages (writes)
@@ -954,8 +999,9 @@ def _build_witness_mpts(state: State) -> None:
     # - Storage changed (storage root changed) - tracked in dirty_storage
     all_dirty_accounts = ws.dirty_accounts | set(ws.dirty_storage.keys())
 
-    # 3. Traverse accounts that were read
-    for address in ws.accessed_accounts:
+    # 3. Traverse all accessed and dirty accounts on the pre-state MPT
+    # to capture pre-state trie nodes before writes mutate the tree.
+    for address in ws.accessed_accounts | all_dirty_accounts:
         mpt_get(main_mpt, address)
 
     # 4. Apply dirty accounts

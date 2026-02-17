@@ -146,6 +146,7 @@ class MutableLeafNode:
     value: Bytes
     _hash: Optional[Bytes] = None  # Cached hash, invalidated on change
     _rlp: Optional[Bytes] = None  # Cached RLP encoding
+    _dirty: bool = False  # True if created during execution (not pre-state)
 
 
 @dataclass
@@ -156,6 +157,7 @@ class MutableExtensionNode:
     child: "MutableNode"
     _hash: Optional[Bytes] = None
     _rlp: Optional[Bytes] = None
+    _dirty: bool = False  # True if created during execution (not pre-state)
 
 
 @dataclass
@@ -166,6 +168,7 @@ class MutableBranchNode:
     value: Bytes  # Value if key terminates at this branch
     _hash: Optional[Bytes] = None
     _rlp: Optional[Bytes] = None
+    _dirty: bool = False  # True if created during execution (not pre-state)
 
 
 MutableNode = Union[
@@ -722,6 +725,10 @@ def _record_witness(
     if node is None:
         return
 
+    # Skip nodes created during execution (not in pre-state)
+    if node._dirty:
+        return
+
     # Record the key if provided
     if key is not None:
         witness.accessed_keys.add(key)
@@ -950,11 +957,11 @@ def _mpt_insert_node(
 
     Returns the new/updated node for this position.
     """
-    _record_witness(mpt.witness, node)
-
     if node is None:
         # Empty slot - create new leaf
-        return MutableLeafNode(rest_of_key=key[level:], value=value)
+        return MutableLeafNode(
+            rest_of_key=key[level:], value=value, _dirty=True
+        )
 
     _invalidate_hash(node)
 
@@ -982,6 +989,7 @@ def _insert_into_leaf(
     if existing_key == remaining_key:
         # Same key - update value
         node.value = value
+        node._dirty = True
         return node
 
     # Keys differ - need to create branch
@@ -997,7 +1005,9 @@ def _insert_into_leaf(
             value,
         )
         return MutableExtensionNode(
-            key_segment=existing_key[:prefix_len], child=branch
+            key_segment=existing_key[:prefix_len],
+            child=branch,
+            _dirty=True,
         )
     else:
         # No common prefix - create branch directly
@@ -1017,15 +1027,21 @@ def _create_branch_from_two_leaves(
         branch_value = value1
     else:
         idx1 = key1[0]
-        children[idx1] = MutableLeafNode(rest_of_key=key1[1:], value=value1)
+        children[idx1] = MutableLeafNode(
+            rest_of_key=key1[1:], value=value1, _dirty=True
+        )
 
     if len(key2) == 0:
         branch_value = value2
     else:
         idx2 = key2[0]
-        children[idx2] = MutableLeafNode(rest_of_key=key2[1:], value=value2)
+        children[idx2] = MutableLeafNode(
+            rest_of_key=key2[1:], value=value2, _dirty=True
+        )
 
-    return MutableBranchNode(children=children, value=branch_value)
+    return MutableBranchNode(
+        children=children, value=branch_value, _dirty=True
+    )
 
 
 def _insert_into_extension(
@@ -1045,6 +1061,7 @@ def _insert_into_extension(
         node.child = _mpt_insert_node(
             mpt, node.child, key, value, level + Uint(prefix_len)
         )
+        node._dirty = True
         return node
 
     # Extension needs to be split
@@ -1052,7 +1069,9 @@ def _insert_into_extension(
         # Partial match - create new extension for common prefix
         new_child = _split_extension(node, remaining_key, value, prefix_len)
         return MutableExtensionNode(
-            key_segment=segment[:prefix_len], child=new_child
+            key_segment=segment[:prefix_len],
+            child=new_child,
+            _dirty=True,
         )
     else:
         # No common prefix - create branch at this level
@@ -1080,7 +1099,9 @@ def _split_extension(
         # Multiple nibbles - create new extension
         idx = segment_after_prefix[0]
         children[idx] = MutableExtensionNode(
-            key_segment=segment_after_prefix[1:], child=node.child
+            key_segment=segment_after_prefix[1:],
+            child=node.child,
+            _dirty=True,
         )
 
     # Place new value
@@ -1091,13 +1112,17 @@ def _split_extension(
         idx = key_after_prefix[0]
         if children[idx] is None:
             children[idx] = MutableLeafNode(
-                rest_of_key=key_after_prefix[1:], value=value
+                rest_of_key=key_after_prefix[1:],
+                value=value,
+                _dirty=True,
             )
         else:
             # Need to merge with existing child (shouldn't happen normally)
             raise AssertionError("Unexpected collision during split")
 
-    return MutableBranchNode(children=children, value=branch_value)
+    return MutableBranchNode(
+        children=children, value=branch_value, _dirty=True
+    )
 
 
 def _insert_into_branch(
@@ -1113,6 +1138,7 @@ def _insert_into_branch(
     if len(remaining_key) == 0:
         # Value terminates at this branch
         node.value = value
+        node._dirty = True
         return node
 
     # Recurse into appropriate child
@@ -1120,6 +1146,7 @@ def _insert_into_branch(
     node.children[child_idx] = _mpt_insert_node(
         mpt, node.children[child_idx], key, value, level + Uint(1)
     )
+    node._dirty = True
     return node
 
 
@@ -1134,8 +1161,6 @@ def _mpt_delete_node(
 
     Returns the updated node (may be different type or None).
     """
-    _record_witness(mpt.witness, node)
-
     if node is None:
         return None
 
@@ -1180,15 +1205,18 @@ def _delete_from_extension(
         return MutableExtensionNode(
             key_segment=segment + new_child.key_segment,
             child=new_child.child,
+            _dirty=True,
         )
     elif isinstance(new_child, MutableLeafNode):
         # Merge extension into leaf
         return MutableLeafNode(
             rest_of_key=segment + new_child.rest_of_key,
             value=new_child.value,
+            _dirty=True,
         )
 
     node.child = new_child
+    node._dirty = True
     return node
 
 
@@ -1211,6 +1239,7 @@ def _delete_from_branch(
             mpt, node.children[child_idx], key, level + Uint(1)
         )
 
+    node._dirty = True
     # Check if branch can be collapsed
     return _collapse_branch(mpt, node)
 
@@ -1233,19 +1262,25 @@ def _collapse_branch(
             return MutableLeafNode(
                 rest_of_key=nibble + child.rest_of_key,
                 value=child.value,
+                _dirty=True,
             )
         elif isinstance(child, MutableExtensionNode):
             return MutableExtensionNode(
                 key_segment=nibble + child.key_segment,
                 child=child.child,
+                _dirty=True,
             )
         else:
             # Child is a branch - create extension
-            return MutableExtensionNode(key_segment=nibble, child=child)
+            return MutableExtensionNode(
+                key_segment=nibble, child=child, _dirty=True
+            )
 
     if len(non_empty) == 0 and node.value != b"":
         # Only value at this branch - convert to leaf
-        return MutableLeafNode(rest_of_key=b"", value=node.value)
+        return MutableLeafNode(
+            rest_of_key=b"", value=node.value, _dirty=True
+        )
 
     return node
 

@@ -351,7 +351,7 @@ def extcodesize(evm: Evm) -> None:
 
     # OPERATION
     code = get_account(evm.message.block_env.state, address).code
-    track_bytecode_access(evm.message.block_env.state, code)
+    track_bytecode_access(evm.message.block_env.state, code, address)
 
     codesize = U256(len(code))
     push(evm.stack, codesize)
@@ -394,7 +394,7 @@ def extcodecopy(evm: Evm) -> None:
     # OPERATION
     evm.memory += b"\x00" * extend_memory.expand_by
     code = get_account(evm.message.block_env.state, address).code
-    track_bytecode_access(evm.message.block_env.state, code)
+    track_bytecode_access(evm.message.block_env.state, code, address)
 
     value = buffer_read(code, code_start_index, size)
     memory_write(evm.memory, memory_start_index, value)
