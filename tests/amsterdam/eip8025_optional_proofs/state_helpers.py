@@ -2,15 +2,26 @@
 
 from collections.abc import Mapping, Sequence
 
+from ethereum_types.bytes import Bytes as EthereumBytes
 from ethereum_types.bytes import Bytes32
-from ethereum_types.numeric import U256
-from execution_testing import Bytes, Storage
+from ethereum_types.numeric import U256, Uint
+from execution_testing import Alloc, Bytes, Storage
+from execution_testing.forks import Amsterdam
 
 from ethereum.forks.amsterdam.incremental_mpt import (
     build_mpt,
     mpt_get,
     mpt_set,
 )
+from ethereum.forks.amsterdam.state import (
+    State as AmsterdamState,
+    set_account,
+    set_storage,
+    store_code,
+)
+from ethereum.forks.amsterdam.trie import EMPTY_TRIE_ROOT, root
+from ethereum.state import Account as EthereumAccount
+from ethereum.state import Address as EthereumAddress
 
 
 def large_storage_value(slot: int) -> int:
@@ -102,3 +113,62 @@ def collect_storage_post_state_only_nodes(
         pre_storage, pre_state_reference_slots
     )
     return _nodes(post_state_nodes - pre_state_nodes)
+
+
+def _build_pre_state(alloc: Alloc) -> AmsterdamState:
+    """Build an Amsterdam state from an execution-testing alloc."""
+    effective_alloc = Alloc.merge(
+        Alloc.model_validate(Amsterdam.pre_allocation_blockchain()),
+        alloc,
+    )
+    state = AmsterdamState()
+    for address, account in effective_alloc.root.items():
+        if account is None:
+            continue
+
+        ethereum_address = EthereumAddress(bytes(address))
+        code_hash = store_code(
+            state, EthereumBytes(bytes(account.code))
+        )
+        set_account(
+            state,
+            ethereum_address,
+            EthereumAccount(
+                nonce=Uint(int(account.nonce)),
+                balance=U256(int(account.balance)),
+                code_hash=code_hash,
+            ),
+        )
+        for key, value in account.storage.root.items():
+            set_storage(
+                state,
+                ethereum_address,
+                Bytes32(int(key).to_bytes(32, byteorder="big")),
+                U256(int(value)),
+            )
+    return state
+
+
+def collect_account_proof_nodes(
+    alloc: Alloc,
+    addresses: Sequence[bytes],
+) -> list[Bytes]:
+    """Collect the pre-state account-trie proof nodes for the given addresses."""
+    state = _build_pre_state(alloc)
+
+    def get_storage_root(address: EthereumAddress) -> bytes:
+        trie = state._storage_tries.get(address)
+        if trie is None:
+            return EMPTY_TRIE_ROOT
+        return root(trie)
+
+    account_mpt = build_mpt(
+        state._main_trie._data,
+        secured=True,
+        default=None,
+        get_storage_root=get_storage_root,
+    )
+    for address in addresses:
+        mpt_get(account_mpt, EthereumAddress(bytes(address)))
+
+    return _nodes(set(account_mpt.witness.accessed_nodes.values()))
