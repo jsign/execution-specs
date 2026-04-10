@@ -25,6 +25,7 @@ from execution_testing import (
     Op,
     Storage,
     Transaction,
+    Withdrawal,
     compute_create_address,
 )
 from execution_testing.test_types.block_access_list.modifiers import (
@@ -43,6 +44,7 @@ from execution_testing.test_types.block_access_list.modifiers import (
     modify_nonce,
     modify_storage,
     remove_accounts,
+    remove_balance_change,
     remove_balances,
     remove_nonces,
     reverse_accounts,
@@ -654,6 +656,72 @@ def test_bal_invalid_balance_value(
                         receiver, block_access_index=1, balance=999999
                     )
                 ),
+            )
+        ],
+    )
+
+
+@pytest.mark.valid_from("Amsterdam")
+@pytest.mark.exception_test
+def test_bal_invalid_missing_withdrawal_balance_change(
+    blockchain_test: BlockchainTestFiller,
+    pre: Alloc,
+) -> None:
+    """
+    Test that clients reject blocks where BAL is missing a required
+    post-execution withdrawal balance change.
+    """
+    alice = pre.fund_eoa()
+    bob = pre.fund_eoa(amount=0)
+    charlie = pre.fund_eoa(amount=0)
+
+    tx = Transaction(
+        sender=alice,
+        to=bob,
+        value=5,
+    )
+
+    blockchain_test(
+        pre=pre,
+        post=pre,
+        blocks=[
+            Block(
+                txs=[tx],
+                withdrawals=[
+                    Withdrawal(
+                        index=0,
+                        validator_index=0,
+                        address=charlie,
+                        amount=10,
+                    )
+                ],
+                exception=BlockException.INVALID_BLOCK_ACCESS_LIST,
+                expected_block_access_list=BlockAccessListExpectation(
+                    account_expectations={
+                        alice: BalAccountExpectation(
+                            nonce_changes=[
+                                BalNonceChange(
+                                    block_access_index=1, post_nonce=1
+                                )
+                            ],
+                        ),
+                        bob: BalAccountExpectation(
+                            balance_changes=[
+                                BalBalanceChange(
+                                    block_access_index=1, post_balance=5
+                                )
+                            ],
+                        ),
+                        charlie: BalAccountExpectation(
+                            balance_changes=[
+                                BalBalanceChange(
+                                    block_access_index=2,
+                                    post_balance=10 * 10**9,
+                                )
+                            ],
+                        ),
+                    }
+                ).modify(remove_balance_change(charlie, 2)),
             )
         ],
     )

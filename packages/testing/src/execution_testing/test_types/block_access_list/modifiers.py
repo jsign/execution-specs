@@ -159,6 +159,46 @@ def remove_balances(
     return _remove_field_from_accounts(addresses, "balance_changes")
 
 
+def remove_balance_change(
+    address: Address, block_access_index: int
+) -> Callable[[BlockAccessList], BlockAccessList]:
+    """Remove one balance change entry for a specific block access index."""
+    found_address = False
+    found_change = False
+
+    def transform(bal: BlockAccessList) -> BlockAccessList:
+        nonlocal found_address, found_change
+        new_root = []
+        for account_change in bal.root:
+            if account_change.address == address:
+                found_address = True
+                new_account = account_change.model_copy(deep=True)
+                original_len = len(new_account.balance_changes)
+                new_account.balance_changes = [
+                    change
+                    for change in new_account.balance_changes
+                    if change.block_access_index != block_access_index
+                ]
+                found_change = len(new_account.balance_changes) != original_len
+                new_root.append(new_account)
+            else:
+                new_root.append(account_change)
+
+        if not found_address:
+            raise ValueError(
+                f"Address {address} not found in BAL to remove balance change"
+            )
+        if not found_change:
+            raise ValueError(
+                f"Balance change at index {block_access_index} not found for "
+                f"{address}"
+            )
+
+        return BlockAccessList(root=new_root)
+
+    return transform
+
+
 def remove_storage(
     *addresses: Address,
 ) -> Callable[[BlockAccessList], BlockAccessList]:
@@ -774,6 +814,7 @@ __all__ = [
     # Field-level modifiers
     "remove_nonces",
     "remove_balances",
+    "remove_balance_change",
     "remove_storage",
     "remove_storage_reads",
     "remove_code",
