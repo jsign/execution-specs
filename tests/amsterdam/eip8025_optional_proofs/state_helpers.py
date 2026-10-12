@@ -9,6 +9,7 @@ from execution_testing.forks import Amsterdam
 
 from ethereum.crypto.hash import Hash32, keccak256
 from ethereum.forks.amsterdam.incremental_mpt import (
+    IncrementalMPT,
     build_mpt,
     mpt_get,
     mpt_root,
@@ -143,6 +144,38 @@ def find_account_with_shared_secured_nibble(
     raise AssertionError("failed to find non-precompile sibling address")
 
 
+def _shared_secured_nibbles(address: Address, other: Address) -> int:
+    """Count the leading nibbles that two addresses' secured keys share."""
+    key = keccak256(bytes(address)).hex()
+    other_key = keccak256(bytes(other)).hex()
+    count = 0
+    while count < len(key) and key[count] == other_key[count]:
+        count += 1
+    return count
+
+
+def find_account_ending_absence_proof(
+    alloc: Alloc,
+    target: Address,
+) -> Address:
+    """
+    Return an address whose leaf would end one account absence proof.
+
+    The address's secured key shares more leading nibbles with the target's
+    than any account in `alloc` does. Once funded, its leaf ends the target's
+    absence proof and lies on no proof of an account in `alloc`.
+    """
+    depth = 1 + max(
+        (_shared_secured_nibbles(target, address) for address in alloc),
+        default=0,
+    )
+    for value in range(0x1000, 0x1000000):
+        address = Address(value)
+        if _shared_secured_nibbles(target, address) >= depth:
+            return address
+    raise AssertionError("failed to find an address to end the proof")
+
+
 def merge_with_amsterdam_pre_alloc(pre: Alloc) -> Alloc:
     """Merge test-local accounts with Amsterdam's implicit pre-allocation."""
     return Alloc.merge(
@@ -177,11 +210,10 @@ def _state_account(account: Account) -> StateAccount:
     )
 
 
-def _collect_account_proof_node_rlps(
+def _build_account_mpt(
     alloc: Alloc,
-    addresses: Sequence[StateAddress | bytes],
-) -> set[bytes]:
-    """Collect witness node RLPs for hashed account proof-path nodes."""
+) -> IncrementalMPT[StateAddress, StateAccount | None]:
+    """Build the account trie of an execution-testing allocation."""
     storage_roots: dict[StateAddress, Root] = {}
     accounts: dict[StateAddress, StateAccount | None] = {}
 
@@ -196,12 +228,20 @@ def _collect_account_proof_node_rlps(
     def get_storage_root(address: StateAddress) -> Root:
         return storage_roots.get(address, EMPTY_TRIE_ROOT)
 
-    account_mpt = build_mpt(
+    return build_mpt(
         accounts,
         secured=True,
         default=None,
         get_storage_root=get_storage_root,
     )
+
+
+def _collect_account_proof_node_rlps(
+    alloc: Alloc,
+    addresses: Sequence[StateAddress | bytes],
+) -> set[bytes]:
+    """Collect witness node RLPs for hashed account proof-path nodes."""
+    account_mpt = _build_account_mpt(alloc)
     for addr in addresses:
         mpt_get(account_mpt, StateAddress(bytes(addr)))
     return set(account_mpt.witness.accessed_nodes.values())
@@ -226,3 +266,19 @@ def collect_account_path_only_nodes(
         alloc, relative_to_addresses
     )
     return _nodes(address_nodes - reference_nodes)
+
+
+def collect_account_delete_auxiliary_nodes(
+    alloc: Alloc,
+    address_to_delete: StateAddress | bytes,
+) -> list[Bytes]:
+    """
+    Collect nodes added only because a delete compressed the account trie.
+    """
+    account_mpt = _build_account_mpt(alloc)
+    address = StateAddress(bytes(address_to_delete))
+    mpt_get(account_mpt, address)
+    before = set(account_mpt.witness.accessed_nodes.values())
+    mpt_set(account_mpt, address, None)
+    after = set(account_mpt.witness.accessed_nodes.values())
+    return _nodes(after - before)

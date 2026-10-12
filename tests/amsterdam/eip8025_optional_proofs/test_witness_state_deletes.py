@@ -1,4 +1,4 @@
-"""Witness state collection scenarios for storage deletes."""
+"""Witness state collection scenarios for storage and account deletes."""
 
 import pytest
 from execution_testing import (
@@ -9,17 +9,22 @@ from execution_testing import (
     ExecutionWitnessStateExpectation,
     Op,
     Transaction,
+    compute_create2_address,
 )
 
 from .spec import ref_spec_8025
 from .state_helpers import (
     as_storage,
     build_large_storage,
+    collect_account_delete_auxiliary_nodes,
+    collect_account_proof_nodes,
     collect_storage_delete_auxiliary_nodes,
     collect_storage_path_only_nodes,
     collect_storage_post_state_only_nodes,
     collect_storage_proof_nodes,
+    find_account_ending_absence_proof,
     large_storage_value,
+    merge_with_amsterdam_pre_alloc,
 )
 
 pytestmark = pytest.mark.valid_from("Amsterdam")
@@ -214,5 +219,76 @@ def test_witness_state_delete_with_dirty_sibling_omits_post_state_node(
         post={
             sender: Account(nonce=1),
             contract: Account(storage=post_storage),
+        },
+    )
+
+
+def test_witness_state_account_delete_branch_collapse_adds_auxiliary_node(
+    pre: Alloc,
+    blockchain_test: BlockchainTestFiller,
+) -> None:
+    """
+    Deleting a pre-funded account from a two-account branch forces collapse.
+
+    A factory deploys a contract with CREATE2 at a pre-funded address, and
+    the initcode self-destructs, sending the balance back to the factory.
+    The contract was created in the same transaction, so the account ends
+    the transaction empty and is deleted from the account trie. The witness
+    should contain both the account's proof and the auxiliary node needed to
+    preserve its untouched sibling.
+    """
+    initcode = bytes(Op.SELFDESTRUCT(Op.CALLER))
+    salt = 0
+    factory = pre.deploy_contract(
+        code=Op.MSTORE(0, Op.PUSH32(initcode))
+        + Op.SSTORE(
+            0,
+            Op.CREATE2(
+                value=0,
+                offset=32 - len(initcode),
+                size=len(initcode),
+                salt=salt,
+            ),
+        )
+        + Op.STOP,
+    )
+    sender = pre.fund_eoa()
+    created = compute_create2_address(factory, salt, initcode)
+    # The sibling's key shares more leading nibbles with the created
+    # account's than any other account's does, so the two leaves hang off
+    # one branch, and deleting the created account collapses it.
+    sibling = find_account_ending_absence_proof(
+        merge_with_amsterdam_pre_alloc(pre), created
+    )
+    pre.fund_address(sibling, 1)
+    # CREATE2 can deploy over an account that holds only a balance.
+    pre.fund_address(created, 1)
+
+    full_alloc = merge_with_amsterdam_pre_alloc(pre)
+    proof_nodes = collect_account_proof_nodes(full_alloc, [created])
+    auxiliary_nodes = collect_account_delete_auxiliary_nodes(
+        full_alloc, created
+    )
+    assert len(auxiliary_nodes) == 1
+
+    tx = Transaction(sender=sender, to=factory, gas_limit=500_000)
+
+    blockchain_test(
+        pre=pre,
+        blocks=[
+            Block(
+                txs=[tx],
+                expected_execution_witness_state=(
+                    ExecutionWitnessStateExpectation(
+                        nodes_present=proof_nodes + auxiliary_nodes,
+                    )
+                ),
+            )
+        ],
+        post={
+            sender: Account(nonce=1),
+            factory: Account(nonce=2, balance=1, storage={0: created}),
+            created: Account.NONEXISTENT,
+            sibling: Account(balance=1, nonce=0),
         },
     )
